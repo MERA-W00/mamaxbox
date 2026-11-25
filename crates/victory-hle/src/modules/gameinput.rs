@@ -63,10 +63,11 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -123,11 +124,12 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    let buttons = FALLBACK_BUTTONS
+        .iter()
+        .filter(|(vk, _)| on(*vk) != 0.0)
+        .fold(0, |all, (_, bit)| all | bit);
     PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
+        buttons,
         left_trigger: on(b'Z'),
         right_trigger: on(b'C'),
         left_x: on(b'D') - on(b'A'),
@@ -455,6 +457,13 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        if any_pad {
+            victory_core::input_status::set_active_device(1);
+        } else if !keys.is_empty() {
+            victory_core::input_status::set_active_device(2);
+        } else {
+            victory_core::input_status::set_active_device(0);
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
@@ -1070,6 +1079,8 @@ pub(crate) fn module() -> HleModule {
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -1113,11 +1124,12 @@ mod host {
     /// Raw values, no dead zone: titles apply their own.
     pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
         let stick = |v: i16| (f32::from(v) / 32767.0).max(-1.0);
+        let buttons = BUTTONS
+            .iter()
+            .filter(|(host, _)| pad.wButtons & host != 0)
+            .fold(0, |all, (_, bit)| all | bit);
         PadState {
-            buttons: BUTTONS
-                .iter()
-                .filter(|(host, _)| pad.wButtons & host != 0)
-                .fold(0, |all, (_, bit)| all | bit),
+            buttons,
             left_trigger: f32::from(pad.bLeftTrigger) / 255.0,
             right_trigger: f32::from(pad.bRightTrigger) / 255.0,
             left_x: stick(pad.sThumbLX),
@@ -1132,33 +1144,79 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
+    static LINUX_PAD_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static LINUX_PAD_STATE: Mutex<Option<PadState>> = Mutex::new(None);
+    static LINUX_PAD_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+    fn init_linux_pad() {
+        LINUX_PAD_INIT.get_or_init(|| {
+            std::thread::Builder::new()
+                .name("linux-udp-pad-listener".into())
+                .spawn(|| {
+                    use std::net::UdpSocket;
+                    let socket = match UdpSocket::bind("127.0.0.1:28777") {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("Failed to bind UDP gamepad listener: {e}");
+                            return;
+                        }
+                    };
+                    let mut buf = [0u8; 28];
+                    while let Ok((len, _)) = socket.recv_from(&mut buf) {
+                        if len == 28 {
+                            let buttons = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                            let left_trigger = f32::from_le_bytes(buf[4..8].try_into().unwrap());
+                            let right_trigger = f32::from_le_bytes(buf[8..12].try_into().unwrap());
+                            let left_x = f32::from_le_bytes(buf[12..16].try_into().unwrap());
+                            let left_y = f32::from_le_bytes(buf[16..20].try_into().unwrap());
+                            let right_x = f32::from_le_bytes(buf[20..24].try_into().unwrap());
+                            let right_y = f32::from_le_bytes(buf[24..28].try_into().unwrap());
+
+                            let pad = PadState {
+                                buttons,
+                                left_trigger,
+                                right_trigger,
+                                left_x,
+                                left_y,
+                                right_x,
+                                right_y,
+                            };
+                            LINUX_PAD_CONNECTED.store(true, Ordering::Relaxed);
+                            if let Ok(mut lock) = LINUX_PAD_STATE.lock() {
+                                *lock = Some(pad);
+                            }
+                            if buttons != 0 {
+                                victory_core::input_status::set_last_button(buttons);
+                            }
+                        }
+                    }
+                })
+                .ok();
+        });
+    }
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
+            init_linux_pad();
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+            if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                self.empty_until[slot] = None;
+                let pad = convert(&state.Gamepad);
+                return Some(pad);
             }
-            self.empty_until[slot] = None;
-            #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
-            if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
+
+            // Direct PS5 / Linux joystick fallback for Slot 0 when XInput does not see device
+            if slot == 0 && LINUX_PAD_CONNECTED.load(Ordering::Relaxed) {
+                if let Ok(lock) = LINUX_PAD_STATE.lock() {
+                    if let Some(pad) = *lock {
+                        return Some(pad);
                     }
                 }
             }
-            Some(pad)
+
+            self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+            None
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1239,11 +1297,16 @@ mod host {
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.is_null() {
+            // Under Proton / Wine on Wayland, GetForegroundWindow often returns null.
+            return true;
+        }
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            GetWindowThreadProcessId(fg, &mut process);
+            process == 0 || process == GetCurrentProcessId()
         }
     }
 

@@ -114,6 +114,8 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Audit and verify kernel-level network isolation status.
+    NetworkStatus,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -183,7 +185,22 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::NetworkStatus => show_network_status(),
     }
+}
+
+fn show_network_status() -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    let status = victory_core::audit_network_isolation();
+    println!("Configured Mode : {:?}", cfg.network_isolation);
+    println!("Kernel Isolated : {}", status.is_kernel_isolated);
+    println!("Loopback (lo)   : {}", if status.loopback_available { "UP (127.0.0.1 available)" } else { "DOWN" });
+    println!("Ext Interfaces  : {:?}", status.external_interfaces);
+    println!("Active Routes   : {}", status.routes_present);
+    println!("Outbound Drops  : {}", if status.outbound_blocked { "Blocked (ENETUNREACH)" } else { "Unrestricted" });
+    println!("Overall Status  : {}", status);
+    tracing::info!(%status, mode = ?cfg.network_isolation, "network isolation status check");
+    Ok(())
 }
 
 fn show_config() -> Result<()> {
@@ -202,6 +219,8 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    let isolation = victory_core::audit_network_isolation();
+    println!("network iso : {:?} ({})", cfg.network_isolation, isolation);
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

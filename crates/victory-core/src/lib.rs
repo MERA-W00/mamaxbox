@@ -6,8 +6,11 @@
 //! * [`logging`]: one tracing setup for all binaries.
 
 pub mod config;
+pub mod input_status;
+pub mod isolation;
 pub mod logging;
 pub mod policy;
 
 pub use config::Config;
+pub use isolation::{IsolationStatus, NetworkConfig, NetworkIsolation, audit_network_isolation};
 pub use policy::{PolicyError, ensure_outside_repo};

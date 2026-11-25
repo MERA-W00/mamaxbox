@@ -17,3 +17,8 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[network]
+# Network isolation mode: "kernel" (Linux netns, loopback only), "hle" (WinSock/WinHTTP interception), or "off"
+# env: VICTORY_NETWORK_ISOLATION
+# isolation = "kernel"

@@ -71,6 +71,12 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    let net_status = victory_core::audit_network_isolation();
+    if net_status.is_kernel_isolated {
+        println!("network        kernel-isolated (loopback only, 0 external routes)");
+    } else {
+        println!("network        {}", net_status);
+    }
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());

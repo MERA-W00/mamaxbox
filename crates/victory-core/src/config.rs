@@ -24,6 +24,8 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// Network isolation policy.
+    pub network_isolation: crate::isolation::NetworkIsolation,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +33,15 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    network: FileNetwork,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileNetwork {
+    #[serde(default)]
+    isolation: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,11 +81,11 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
-        file: FilePaths,
+        file: FileConfig,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
@@ -83,20 +94,32 @@ impl Config {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
-            _ => file.test_titles,
+            _ => file.paths.test_titles,
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
-            .or(file.cache_dir)
+            .or(file.paths.cache_dir)
             .map_or_else(|| default_dir("cache"), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
-            .or(file.data_dir)
+            .or(file.paths.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        let network_isolation = env("VICTORY_NETWORK_ISOLATION")
+            .and_then(|v| v.into_string().ok())
+            .as_deref()
+            .and_then(crate::isolation::NetworkIsolation::parse)
+            .or_else(|| {
+                file.network
+                    .isolation
+                    .as_deref()
+                    .and_then(crate::isolation::NetworkIsolation::parse)
+            })
+            .unwrap_or(crate::isolation::NetworkIsolation::Kernel);
         Ok(Config {
-            game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            game_dir: env_path("VICTORY_GAME_DIR").or(file.paths.game_dir),
             cache_dir,
             data_dir,
             test_titles,
             source,
+            network_isolation,
         })
     }
 
@@ -143,9 +166,12 @@ mod tests {
 
     #[test]
     fn environment_overrides_file() {
-        let file = FilePaths {
-            game_dir: Some("from-file".into()),
-            cache_dir: Some("cache-from-file".into()),
+        let file = FileConfig {
+            paths: FilePaths {
+                game_dir: Some("from-file".into()),
+                cache_dir: Some("cache-from-file".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
@@ -156,8 +182,11 @@ mod tests {
 
     #[test]
     fn empty_env_values_are_ignored() {
-        let file = FilePaths {
-            game_dir: Some("from-file".into()),
+        let file = FileConfig {
+            paths: FilePaths {
+                game_dir: Some("from-file".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
@@ -167,8 +196,11 @@ mod tests {
 
     #[test]
     fn empty_test_titles_env_is_ignored() {
-        let file = FilePaths {
-            test_titles: vec!["from-file".into()],
+        let file = FileConfig {
+            paths: FilePaths {
+                test_titles: vec!["from-file".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
@@ -179,7 +211,7 @@ mod tests {
     #[test]
     fn test_titles_env_splits_paths() {
         let value = std::env::join_paths(["first", "second"]).unwrap();
-        let file = FilePaths::default();
+        let file = FileConfig::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(

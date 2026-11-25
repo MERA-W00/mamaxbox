@@ -68,12 +68,33 @@ type Handle = *mut c_void;
 
 /// Logs `what` for `destination` the first time (no payload, ever).
 fn once(what: &'static str, destination: String) {
+    ensure_isolation_audited();
     static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.iter().any(|(w, d)| *w == what && *d == destination) {
         tracing::info!(%destination, "{what}");
         seen.push((what, destination));
     }
+}
+
+fn ensure_isolation_audited() {
+    static AUDITED: std::sync::Once = std::sync::Once::new();
+    AUDITED.call_once(|| {
+        let status = victory_core::isolation::audit_network_isolation();
+        if status.is_kernel_isolated {
+            tracing::info!(
+                interfaces = ?status.external_interfaces,
+                routes = status.routes_present,
+                "Kernel-level network isolation confirmed: external traffic dropped at kernel boundary"
+            );
+        } else {
+            tracing::warn!(
+                interfaces = ?status.external_interfaces,
+                routes = status.routes_present,
+                "Kernel-level network isolation inactive: relying on WinSock/WinHTTP HLE filtering"
+            );
+        }
+    });
 }
 
 fn wsa_error(code: i32) {
@@ -832,6 +853,15 @@ fn ordinal(name: &'static str, f: usize) -> HleExport {
 }
 
 pub(crate) fn module() -> HleModule {
+    static AUDIT_ONCE: std::sync::Once = std::sync::Once::new();
+    AUDIT_ONCE.call_once(|| {
+        let status = victory_core::audit_network_isolation();
+        if status.is_kernel_isolated {
+            tracing::info!("kernel-level network isolation active: title network stack confined to loopback");
+        } else {
+            tracing::warn!(%status, "kernel network isolation inactive; relying on user-space HLE WinSock hooks");
+        }
+    });
     HleModule {
         name: "net",
         dlls: &["ws2_32.dll", "winhttp.dll"],

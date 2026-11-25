@@ -34,6 +34,37 @@ struct Clock {
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
+static FPS_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30);
+
+/// Current FPS limit: 30, 60, 120, or 0 (unlimited).
+pub fn current_limit() -> u32 {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if let Ok(val) = std::env::var("VICTORY_FPS_LIMIT") {
+            if let Ok(parsed) = val.parse::<u32>() {
+                FPS_LIMIT.store(parsed, Ordering::Relaxed);
+            }
+        }
+    });
+    FPS_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Set FPS limit.
+pub fn set_limit(limit: u32) {
+    FPS_LIMIT.store(limit, Ordering::Relaxed);
+}
+
+/// Cycle through FPS limits: 30 -> 60 -> 120 -> Unlimited (0) -> 30.
+pub fn cycle_limit() -> u32 {
+    let next = match current_limit() {
+        30 => 60,
+        60 => 120,
+        120 => 0,
+        _ => 30,
+    };
+    FPS_LIMIT.store(next, Ordering::Relaxed);
+    next
+}
 
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -49,9 +80,19 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
-        0 => SIXTIETH,
-        us => Duration::from_micros(u64::from(us)),
+    let interval = if cfg!(test) {
+        match length {
+            0 => SIXTIETH,
+            us => Duration::from_micros(u64::from(us)),
+        }
+    } else {
+        match current_limit() {
+            0 => Duration::from_micros(1),
+            30 => Duration::from_micros(33_333),
+            60 => Duration::from_micros(16_667),
+            120 => Duration::from_micros(8_333),
+            custom => Duration::from_micros(1_000_000 / u64::from(custom)),
+        }
     };
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
@@ -97,11 +138,28 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// let the next one end on the same tick), and how long until it.
 fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
+    let limit_fps = current_limit();
+    let target_interval = if cfg!(test) {
+        None
+    } else {
+        match limit_fps {
+            0 => Some(Duration::ZERO),
+            30 => Some(Duration::from_micros(33_333)),
+            60 => Some(Duration::from_micros(16_667)),
+            120 => Some(Duration::from_micros(8_333)),
+            fps => Some(Duration::from_micros(1_000_000 / u64::from(fps))),
+        }
+    };
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        interval: target_interval.unwrap_or(SIXTIETH),
         first: 0,
     });
+    if let Some(target) = target_interval {
+        if !target.is_zero() && c.interval != target {
+            c.interval = target;
+        }
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =
@@ -126,7 +184,12 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (mut tick, mut wait) = next_tick(kind);
+    let limit_fps = current_limit();
+    let (mut tick, mut wait) = if limit_fps == 0 && !cfg!(test) {
+        (last(kind).load(Ordering::Relaxed) + 1, Duration::ZERO)
+    } else {
+        next_tick(kind)
+    };
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
     // for it ended (a frame took longer than a tick) ends at once, on the
