@@ -188,6 +188,8 @@ pub fn sample_cpu_percent() -> u8 {
     35
 }
 
+static GPU_EMA: Mutex<f32> = Mutex::new(25.0);
+
 pub fn record_gpu_sample(gpu_pct: u8) {
     let cpu_pct = sample_cpu_percent();
     let mut cpu = CPU_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -199,14 +201,19 @@ pub fn record_gpu_sample(gpu_pct: u8) {
     }
     cpu.push(cpu_pct);
 
+    let mut ema = GPU_EMA.lock().unwrap_or_else(|e| e.into_inner());
+    let smoothed = (*ema * 0.7 + (gpu_pct as f32) * 0.3).clamp(1.0, 99.0);
+    *ema = smoothed;
+    let final_pct = smoothed.round() as u8;
+
     let mut gpu = GPU_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
     if gpu.is_empty() {
-        gpu.extend(vec![35; 39]);
+        gpu.extend(vec![final_pct; 39]);
     }
     if gpu.len() >= 40 {
         gpu.remove(0);
     }
-    gpu.push(gpu_pct);
+    gpu.push(final_pct);
 }
 
 /// Whether the dropdown menu is dropped down / open.
@@ -233,19 +240,13 @@ static RT_DYNAMIC: AtomicBool = AtomicBool::new(false); // Default: safe false (
 static RT_LIGHTS: AtomicBool = AtomicBool::new(false);
 static BVH_GUARD: AtomicBool = AtomicBool::new(true); // Default: hold unbuilt BVH dispatches
 
-// FSR
-pub const FSR_MODES: &[&str] = &["OFF", "ULTRA", "QUALITY", "BALANCED", "PERFORMANCE"];
-static FSR_IDX: AtomicUsize = AtomicUsize::new(2); // Default: Quality
-pub const FSR_SHARPNESS: &[&str] = &["0.0", "0.2", "0.5", "0.8", "1.0"];
-static FSR_SHARP_IDX: AtomicUsize = AtomicUsize::new(1); // Default: 0.2
-
 // Graphics & Performance
 static WATER_SSR: AtomicBool = AtomicBool::new(false); // Default: safe false
 static ASYNC_COMPUTE: AtomicBool = AtomicBool::new(true);
 static MOTION_BLUR: AtomicBool = AtomicBool::new(false);
 static CONTROLS_EXPANDED: AtomicBool = AtomicBool::new(true);
 
-const TOTAL_ROWS: usize = 11;
+const TOTAL_ROWS: usize = 9;
 
 /// Whether the overlay is enabled at all.
 fn on() -> bool {
@@ -289,8 +290,6 @@ fn persist_settings_async() {
         let (w, h, _) = RESOLUTIONS[res_idx];
         let rt_dyn = RT_DYNAMIC.load(Ordering::Relaxed);
         let rt_light = RT_LIGHTS.load(Ordering::Relaxed);
-        let fsr_mode = FSR_IDX.load(Ordering::Relaxed).min(FSR_MODES.len() - 1);
-        let fsr_sharp_str = FSR_SHARPNESS[FSR_SHARP_IDX.load(Ordering::Relaxed).min(FSR_SHARPNESS.len() - 1)];
         let water_ssr = WATER_SSR.load(Ordering::Relaxed);
         let async_comp = ASYNC_COMPUTE.load(Ordering::Relaxed);
         let m_blur = MOTION_BLUR.load(Ordering::Relaxed);
@@ -311,10 +310,6 @@ fn persist_settings_async() {
                 *line = format!("    <rtDynamicShadows value=\"{}\" />", rt_dyn);
             } else if line.contains("<rtLODLightShadows value=") {
                 *line = format!("    <rtLODLightShadows value=\"{}\" />", rt_light);
-            } else if line.contains("<fsrQuality value=") {
-                *line = format!("    <fsrQuality value=\"{}\" />", fsr_mode);
-            } else if line.contains("<fsrSharpen value=") {
-                *line = format!("    <fsrSharpen value=\"{:.6}\" />", fsr_sharp_str.parse::<f64>().unwrap_or(0.2));
             } else if line.contains("<waterReflectionSSR value=") {
                 *line = format!("    <waterReflectionSSR value=\"{}\" />", water_ssr);
             } else if line.contains("<asyncComputeEnabled value=") {
@@ -363,28 +358,6 @@ fn change_setting(row: usize, dir: i32) {
             BVH_GUARD.store(!cur, Ordering::Relaxed);
         }
         4 => {
-            // FSR Mode
-            let cur = FSR_IDX.load(Ordering::Relaxed);
-            let next = if dir < 0 {
-                if cur == 0 { FSR_MODES.len() - 1 } else { cur - 1 }
-            } else {
-                (cur + 1) % FSR_MODES.len()
-            };
-            FSR_IDX.store(next, Ordering::Relaxed);
-            persist_settings_async();
-        }
-        5 => {
-            // FSR Sharpening
-            let cur = FSR_SHARP_IDX.load(Ordering::Relaxed);
-            let next = if dir < 0 {
-                if cur == 0 { FSR_SHARPNESS.len() - 1 } else { cur - 1 }
-            } else {
-                (cur + 1) % FSR_SHARPNESS.len()
-            };
-            FSR_SHARP_IDX.store(next, Ordering::Relaxed);
-            persist_settings_async();
-        }
-        6 => {
             // FPS Limit
             if dir < 0 {
                 let prev = match crate::frame::current_limit() {
@@ -398,25 +371,25 @@ fn change_setting(row: usize, dir: i32) {
                 crate::frame::cycle_limit();
             }
         }
-        7 => {
+        5 => {
             // Water SSR
             let cur = WATER_SSR.load(Ordering::Relaxed);
             WATER_SSR.store(!cur, Ordering::Relaxed);
             persist_settings_async();
         }
-        8 => {
+        6 => {
             // Async Compute
             let cur = ASYNC_COMPUTE.load(Ordering::Relaxed);
             ASYNC_COMPUTE.store(!cur, Ordering::Relaxed);
             persist_settings_async();
         }
-        9 => {
+        7 => {
             // Motion Blur
             let cur = MOTION_BLUR.load(Ordering::Relaxed);
             MOTION_BLUR.store(!cur, Ordering::Relaxed);
             persist_settings_async();
         }
-        10 => {
+        8 => {
             // Controls Cheatsheet
             let cur = CONTROLS_EXPANDED.load(Ordering::Relaxed);
             CONTROLS_EXPANDED.store(!cur, Ordering::Relaxed);
@@ -699,39 +672,15 @@ fn get_overlay_lines(
     };
     lines.push(format!("{} BVH GUARD  : {}", marker(3), bvh_str));
 
-    // 3. FSR
-    lines.push("-- [3] AMD FIDELITYFX FSR -----------------------------------------".to_string());
-    let fsr_idx = FSR_IDX.load(Ordering::Relaxed);
-    let mut fsr_line = format!("{} FSR 3.1    : ", marker(4));
-    for (i, &name) in FSR_MODES.iter().enumerate() {
-        if i == fsr_idx {
-            fsr_line.push_str(&format!(" *[{}]*", name));
-        } else {
-            fsr_line.push_str(&format!("  {} ", name));
-        }
-    }
-    lines.push(fsr_line);
-
-    let fsr_sharp_idx = FSR_SHARP_IDX.load(Ordering::Relaxed);
-    let mut sharp_line = format!("{} SHARPENING : ", marker(5));
-    for (i, &val) in FSR_SHARPNESS.iter().enumerate() {
-        if i == fsr_sharp_idx {
-            sharp_line.push_str(&format!(" *[{}]*", val));
-        } else {
-            sharp_line.push_str(&format!("  {} ", val));
-        }
-    }
-    lines.push(sharp_line);
-
-    // 4. Graphics & Pace
-    lines.push("-- [4] GRAPHICS & FRAME PACING ------------------------------------".to_string());
+    // 3. Graphics & Pace
+    lines.push("-- [3] GRAPHICS & FRAME PACING ------------------------------------".to_string());
     let limit_str = match limit {
         30 => " *[30]*   60    120   UNLIMITED",
         60 => "  30   *[60]*   120   UNLIMITED",
         120 => "  30    60   *[120]*  UNLIMITED",
         _ => "  30    60    120  *[UNLIMITED]*",
     };
-    lines.push(format!("{} FPS LIMIT  : {}  <F1>", marker(6), limit_str));
+    lines.push(format!("{} FPS LIMIT  : {}  <F1>", marker(4), limit_str));
 
     let w_ssr = WATER_SSR.load(Ordering::Relaxed);
     let ssr_str = if w_ssr {
@@ -739,21 +688,21 @@ fn get_overlay_lines(
     } else {
         " *[OFF (STABLE)]*        ON                  "
     };
-    lines.push(format!("{} WATER SSR  : {}", marker(7), ssr_str));
+    lines.push(format!("{} WATER SSR  : {}", marker(5), ssr_str));
 
     let async_c = ASYNC_COMPUTE.load(Ordering::Relaxed);
     let async_str = if async_c { " *[ENABLED]*    DISABLED" } else { "   ENABLED   *[DISABLED]*" };
-    lines.push(format!("{} ASYNC COMP : {}", marker(8), async_str));
+    lines.push(format!("{} ASYNC COMP : {}", marker(6), async_str));
 
     let mb = MOTION_BLUR.load(Ordering::Relaxed);
     let mb_str = if mb { "   OFF       *[ON]*" } else { " *[OFF]*       ON  " };
-    lines.push(format!("{} MOTION BLUR: {}", marker(9), mb_str));
+    lines.push(format!("{} MOTION BLUR: {}", marker(7), mb_str));
 
-    // 5. Cheatsheet
-    lines.push("-- [5] INPUT & CONTROLLER CHEATSHEET ------------------------------".to_string());
+    // 4. Cheatsheet
+    lines.push("-- [4] INPUT & CONTROLLER CHEATSHEET ------------------------------".to_string());
     let expanded = CONTROLS_EXPANDED.load(Ordering::Relaxed);
     let expand_tag = if expanded { "[- HIDE]" } else { "[+ EXPAND]" };
-    lines.push(format!("{} DUALSENSE / XBOX / KEYBOARD CHEATSHEET  {}", marker(10), expand_tag));
+    lines.push(format!("{} DUALSENSE / XBOX / KEYBOARD CHEATSHEET  {}", marker(8), expand_tag));
     if expanded {
         lines.push("  SELECT: [X / A / ENTER]        BACK: [O / B / BKSP]".to_string());
         lines.push("  ACTION: [SQR / X / X]          MENU: [TRI / Y / Y]".to_string());
@@ -931,7 +880,6 @@ pub(crate) fn draw(
 
         let res_idx = RES_IDX.load(Ordering::Relaxed);
         let rt_dyn = RT_DYNAMIC.load(Ordering::Relaxed);
-        let fsr_idx = FSR_IDX.load(Ordering::Relaxed);
         let (cur_w, cur_h) = crate::dxgi::current_display_size();
 
         let key = {
@@ -940,7 +888,6 @@ pub(crate) fn draw(
             h ^= (limit as u64) << 48;
             h ^= (focused_row as u64) << 56;
             h ^= (res_idx as u64) << 8;
-            h ^= (fsr_idx as u64) << 24;
             h ^= ((cur_w as u64) << 36) ^ ((cur_h as u64) << 12);
             h ^= if rt_dyn { 1 << 62 } else { 0 };
             h ^= if menu_open { 1 << 63 } else { 0 };
@@ -1338,7 +1285,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("2560p")));
         assert!(lines.iter().any(|l| l.contains("4K")));
         assert!(lines.iter().any(|l| l.contains("DYNAMIC RT")));
-        assert!(lines.iter().any(|l| l.contains("FSR 3.1")));
+        assert!(lines.iter().any(|l| l.contains("GRAPHICS & FRAME PACING")));
+        assert!(!lines.iter().any(|l| l.contains("FSR")));
     }
 
     #[test]
