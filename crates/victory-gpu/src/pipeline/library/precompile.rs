@@ -56,7 +56,7 @@ fn completed() -> &'static Mutex<HashSet<String>> {
 /// makes that second object lazily. The offline pass can make both before
 /// marking the title recipe complete.
 pub(in crate::pipeline) fn build(p: &Pending, offline: bool) -> Option<HostPipeline> {
-    if crate::pipeline::make::is_bad_key(&p.key) || crate::pipeline::is_skipped_shaders(&p.shaders) {
+    if crate::pipeline::make::is_bad_pipeline(&p.key, &p.shaders) || crate::pipeline::is_skipped_shaders(&p.shaders) {
         return None;
     }
     crate::pipeline::make::set_journal_context(p);

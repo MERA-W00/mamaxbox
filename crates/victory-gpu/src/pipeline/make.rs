@@ -79,7 +79,7 @@ impl Pending {
 
     pub(in crate::pipeline) fn make(self: &Arc<Self>) {
         if self.made.get().is_none() {
-            let should_skip = is_bad_key(&self.key) || super::is_skipped_shaders(&self.shaders);
+            let should_skip = is_bad_pipeline(&self.key, &self.shaders) || super::is_skipped_shaders(&self.shaders);
             let made = if should_skip {
                 SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: pipeline is skipped or crashed before");
@@ -154,18 +154,32 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
+        let mut set = std::collections::HashSet::new();
+        for line in listed.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(key) = trimmed.split_whitespace().next() {
+                if key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    set.insert(key.to_ascii_lowercase());
+                }
+            }
+            for token in trimmed.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if token.len() == 16 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    set.insert(token.to_ascii_lowercase());
+                }
+            }
+        }
+        set
     });
     f(keys)
 }
 
-pub(in crate::pipeline) fn is_bad_key(key: &str) -> bool {
-    bad_keys(|keys| keys.contains(key))
+pub(in crate::pipeline) fn is_bad_pipeline(key: &str, shaders: &[Arc<super::Shader>]) -> bool {
+    bad_keys(|keys| {
+        keys.contains(key) || shaders.iter().any(|s| keys.contains(&s.hash))
+    })
 }
 
 thread_local! {
