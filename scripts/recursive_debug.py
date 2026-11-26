@@ -111,7 +111,7 @@ def run_debug_cycle(max_wait_seconds=60):
     env["VICTORY_WINDOW_UPLOAD"] = "1"
     env["VICTORY_TEXTURE_SWEEP"] = "0"
     env["VICTORY_CARD_ACCOUNTING"] = "1"
-    env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148"
+    env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148,2486510c8afeef34"
 
     print(f"[Supervisor] Launching {LAUNCHER}...", file=sys.stderr)
     proc = subprocess.Popen([LAUNCHER], env=env, preexec_fn=os.setsid)

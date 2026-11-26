@@ -146,7 +146,20 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    translate(&self.container)
+                }))
+                .unwrap_or_else(|p| {
+                    let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = p.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "translation panicked".to_string()
+                    };
+                    tracing::error!(hash = %self.hash, stage = self.stage, error = %msg, "shader translation panicked");
+                    Err(msg)
+                });
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
