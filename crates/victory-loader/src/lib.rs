@@ -23,6 +23,9 @@
 
 #[cfg(windows)]
 mod console_cpu;
+// Crash reporting uses Windows structured exceptions and must be compiled
+// only with the Windows loader it reports for.
+#[cfg(windows)]
 mod crash;
 pub mod prepare;
 #[cfg(any(windows, test))]

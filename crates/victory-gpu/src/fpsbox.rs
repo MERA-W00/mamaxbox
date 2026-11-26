@@ -321,6 +321,10 @@ fn persist_settings_async() {
                 *line = format!("    <asyncComputeEnabled value=\"{}\" />", async_comp);
             } else if line.contains("<motionBlur value=") {
                 *line = format!("    <motionBlur value=\"{}\" />", m_blur);
+            } else if line.contains("<desiredFPS value=") {
+                *line = format!("    <desiredFPS value=\"{}\" />", crate::frame::current_limit());
+            } else if line.contains("<frameRateLimit value=") {
+                *line = format!("    <frameRateLimit value=\"{}\" />", crate::frame::current_limit());
             }
         }
 
@@ -397,6 +401,7 @@ fn change_setting(row: usize, dir: i32) {
             } else {
                 crate::frame::cycle_limit();
             }
+            persist_settings_async();
         }
         7 => {
             // Water SSR

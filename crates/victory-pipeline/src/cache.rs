@@ -59,10 +59,15 @@ impl Cache {
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("reusing the staging file {}", tmp.display()))?,
+            Err(e) => return Err(e.into()),
+        };
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));

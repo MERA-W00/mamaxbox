@@ -106,13 +106,19 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
-    // Neutralize title engine watchdog timeout abort (vucomiss + jae) if present.
-    // Pattern: c5 78 2e c7 73 2e 48 ff c7
-    let watchdog_pattern = [0xc5, 0x78, 0x2e, 0xc7, 0x73, 0x2e, 0x48, 0xff, 0xc7];
-    if let Some(pos) = bytes.windows(watchdog_pattern.len()).position(|w| w == watchdog_pattern) {
-        bytes[pos + 4] = 0x90; // NOP out `jae 0x142215c0c`
-        bytes[pos + 5] = 0x90;
-        tracing::info!("patched title engine watchdog abort branch to NOPs at file offset {pos:#x}");
+    let watchdog_patches = patch_title_watchdog(&mut bytes);
+    if watchdog_patches != 0 {
+        tracing::info!(watchdog_patches, "patched title engine watchdog abort branch");
+    }
+
+    // The title's worker wait code intentionally writes to address zero after
+    // an optional fatal-report callback.  In a console process that callback
+    // is installed by the platform.  It is absent in our hosted process, so a
+    // recoverable worker timeout becomes an unconditional access violation.
+    // Continue at the retry path when the callback is unavailable instead.
+    let failfast_patches = patch_title_missing_fatal_callback(&mut bytes);
+    if failfast_patches != 0 {
+        tracing::info!(failfast_patches, "patched title worker fail-fast without platform callback");
     }
 
     Ok(PreparedImage {
@@ -124,6 +130,48 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
+
+/// Replaces the conditional jump to the title's watchdog fatal path.
+///
+/// This signature is intentionally complete enough to avoid changing an
+/// unrelated floating-point comparison in another title build.
+fn patch_title_watchdog(bytes: &mut [u8]) -> usize {
+    const PATTERN: [u8; 9] = [0xc5, 0x78, 0x2e, 0xc7, 0x73, 0x2e, 0x48, 0xff, 0xc7];
+    let mut patches = 0;
+    let positions: Vec<_> = bytes
+        .windows(PATTERN.len())
+        .enumerate()
+        .filter_map(|(pos, window)| (window == PATTERN).then_some(pos))
+        .collect();
+    for pos in positions {
+        bytes[pos + 4..pos + 6].copy_from_slice(&[0x90, 0x90]);
+        patches += 1;
+    }
+    patches
+}
+
+/// Bypasses the title's deliberate null write used when its platform fatal
+/// callback is absent. `EB 0E` jumps from the conditional branch to the first
+/// instruction after the `mov dword ptr [0], 0; int3` fail-fast sequence.
+fn patch_title_missing_fatal_callback(bytes: &mut [u8]) -> usize {
+    const PATTERN: [u8; 16] = [
+        0x74, 0x02, // je +2 (to the fail-fast sequence when the callback is null)
+        0xff, 0xd0, // call callback when it is present (the callback does not return)
+        0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xcc,
+    ];
+    let mut patches = 0;
+    let positions: Vec<_> = bytes
+        .windows(PATTERN.len())
+        .enumerate()
+        .filter_map(|(pos, window)| (window == PATTERN).then_some(pos))
+        .collect();
+    for pos in positions {
+        bytes[pos..pos + 2].copy_from_slice(&[0xeb, 0x0e]);
+        patches += 1;
+    }
+    patches
+}
 
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
 /// RVA it patches). Empty if the image has no readable relocation table.
@@ -183,6 +231,41 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 }
 
 #[cfg(test)]
+mod patch_tests {
+    use super::{patch_title_missing_fatal_callback, patch_title_watchdog};
+
+    #[test]
+    fn bypasses_only_the_missing_fatal_callback_path() {
+        let mut bytes = [
+            0x74, 0x02, 0xff, 0xd0, 0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xcc,
+        ];
+        assert_eq!(patch_title_missing_fatal_callback(&mut bytes), 1);
+        assert_eq!(&bytes[..2], &[0xeb, 0x0e]);
+        assert_eq!(
+            &bytes[2..],
+            &[0xff, 0xd0, 0xc7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0xcc]
+        );
+    }
+
+    #[test]
+    fn ignores_an_incomplete_fatal_callback_signature() {
+        let mut bytes = [
+            0x74, 0x02, 0xff, 0xd0, 0xc7, 0x04, 0x25, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(patch_title_missing_fatal_callback(&mut bytes), 0);
+        assert_eq!(bytes[0], 0x74);
+    }
+
+    #[test]
+    fn neutralizes_the_known_watchdog_branch() {
+        let mut bytes = [0xc5, 0x78, 0x2e, 0xc7, 0x73, 0x2e, 0x48, 0xff, 0xc7];
+        assert_eq!(patch_title_watchdog(&mut bytes), 1);
+        assert_eq!(&bytes[4..6], &[0x90, 0x90]);
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

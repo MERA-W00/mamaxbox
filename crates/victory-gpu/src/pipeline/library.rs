@@ -862,12 +862,13 @@ pub(super) fn warm_enabled() -> bool {
         && *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WARMUP").is_none_or(|v| v != "0"))
 }
 
-/// Recording needs one relaxed increment per lookup. Starting the reader
-/// prewarms saved pipeline recipes off-thread during initial loading so
-/// entering the 3D world finds host pipelines already built (`VICTORY_PIPELINE_WARMUP=0`: off).
+/// Recording needs one relaxed increment per lookup. Startup replay of
+/// saved recipes compiles hundreds of compute pipelines before the title
+/// draws and crashed the NVIDIA driver natively (runs of 2026-11-26), so it
+/// stays opt-in: `VICTORY_PIPELINE_WARMUP=1`.
 pub(super) fn replay_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    warm_enabled() && *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WARMUP").is_none_or(|v| v != "0"))
+    warm_enabled() && *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WARMUP").is_some_and(|v| v == "1"))
 }
 
 /// Approach after XCL 354ce0c: record the pipelines requested by a bind.
