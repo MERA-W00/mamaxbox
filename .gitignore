@@ -78,3 +78,4 @@ Thumbs.db
 .DS_Store
 vkd3d-proton.cache*
 *.cache
+__pycache__/

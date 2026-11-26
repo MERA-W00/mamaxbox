@@ -106,6 +106,15 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
+    // Neutralize title engine watchdog timeout abort (vucomiss + jae) if present.
+    // Pattern: c5 78 2e c7 73 2e 48 ff c7
+    let watchdog_pattern = [0xc5, 0x78, 0x2e, 0xc7, 0x73, 0x2e, 0x48, 0xff, 0xc7];
+    if let Some(pos) = bytes.windows(watchdog_pattern.len()).position(|w| w == watchdog_pattern) {
+        bytes[pos + 4] = 0x90; // NOP out `jae 0x142215c0c`
+        bytes[pos + 5] = 0x90;
+        tracing::info!("patched title engine watchdog abort branch to NOPs at file offset {pos:#x}");
+    }
+
     Ok(PreparedImage {
         info,
         bytes,

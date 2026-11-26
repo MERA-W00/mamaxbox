@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -22,6 +22,8 @@ static TENTHS: AtomicU32 = AtomicU32::new(300);
 static MS_TENTHS: AtomicU32 = AtomicU32::new(333);
 /// Average draw calls per frame.
 static DRAWS: AtomicU32 = AtomicU32::new(21);
+/// Current engine presentation frame number.
+static CURRENT_FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// Global GPU overload fail-safe state
 static GPU_OVERLOAD: AtomicBool = AtomicBool::new(false);
@@ -258,7 +260,7 @@ pub(crate) fn set(fps: f64) {
 }
 
 /// Update full performance metrics.
-pub(crate) fn set_metrics(fps: f64, ms: f64, draws: f64) {
+pub(crate) fn set_metrics(fps: f64, ms: f64, draws: f64, frame: u64) {
     set(fps);
     if ms.is_finite() && ms >= 0.0 {
         MS_TENTHS.store((ms * 10.0).round().min(99_999.0) as u32, Ordering::Relaxed);
@@ -266,6 +268,7 @@ pub(crate) fn set_metrics(fps: f64, ms: f64, draws: f64) {
     if draws.is_finite() && draws >= 0.0 {
         DRAWS.store(draws.round().min(99_999.0) as u32, Ordering::Relaxed);
     }
+    CURRENT_FRAME.store(frame, Ordering::Relaxed);
 }
 
 /// Sync active in-memory settings to the game's settings.xml file.
@@ -626,6 +629,7 @@ fn get_overlay_lines(
     tenths: u32,
     ms: f64,
     draws: f64,
+    frame: u64,
     limit: u32,
     menu_open: bool,
     focused_row: usize,
@@ -636,9 +640,9 @@ fn get_overlay_lines(
     // If dropdown menu is closed, show a concise HUD bar
     if !menu_open {
         let hud_title = if let Some(toast) = active_toast() {
-            format!("SCARLETT HUD | {:>4.1} FPS | {} | [F4: GRAPHS]", fps_f, toast)
+            format!("SCARLETT HUD | {:>4.1} FPS | FRAME: {} | {} | [F4: GRAPHS]", fps_f, frame, toast)
         } else {
-            format!("SCARLETT HUD | {:>4.1} FPS ({:>4.1} MS) | {:>4}x{:<4} | [F2: MENU] [F3: HIDE] [F4: GRAPHS]", fps_f, ms, cur_w, cur_h)
+            format!("SCARLETT HUD | {:>4.1} FPS ({:>4.1} MS) | FRAME: {} | {:>4}x{:<4} | [F2: MENU] [F3: HIDE] [F4: GRAPHS]", fps_f, ms, frame, cur_w, cur_h)
         };
         return vec![hud_title];
     }
@@ -646,7 +650,7 @@ fn get_overlay_lines(
     let mut lines = Vec::new();
     lines.push("===================================================================".to_string());
     lines.push(" [v] SCARLETT GRAPHICS & PERFORMANCE DROPDOWN MENU     <F2: CLOSE>".to_string());
-    lines.push(format!(" PERF: {:>4.1} FPS ({:>4.1} MS) | {:>2.0} DRAWS | ACTIVE: {:>4}x{:<4}", fps_f, ms, draws, cur_w, cur_h));
+    lines.push(format!(" PERF: {:>4.1} FPS ({:>4.1} MS) | {:>2.0} DRAWS | FRAME: {:<6} | ACTIVE: {:>4}x{:<4}", fps_f, ms, draws, frame, cur_w, cur_h));
     lines.push("===================================================================".to_string());
 
     let marker = |row: usize| -> &'static str {
@@ -898,6 +902,7 @@ pub(crate) fn draw(
     let tenths = TENTHS.load(Ordering::Relaxed);
     let ms_tenths = MS_TENTHS.load(Ordering::Relaxed);
     let draws = DRAWS.load(Ordering::Relaxed);
+    let current_frame = CURRENT_FRAME.load(Ordering::Relaxed);
     let limit = crate::frame::current_limit();
     let menu_open = MENU_OPEN.load(Ordering::Relaxed);
     let focused_row = CURRENT_ROW.load(Ordering::Relaxed);
@@ -934,6 +939,7 @@ pub(crate) fn draw(
             h ^= (dlss_idx as u64) << 24;
             h ^= (nis_idx as u64) << 20;
             h ^= ((cur_w as u64) << 36) ^ ((cur_h as u64) << 12);
+            h ^= current_frame.rotate_left(11);
             h ^= if rt_dyn { 1 << 62 } else { 0 };
             h ^= if menu_open { 1 << 63 } else { 0 };
             h ^= (format.0 as u64) << 28;
@@ -943,7 +949,7 @@ pub(crate) fn draw(
 
         if !made.contains_key(&key) {
             let ms = (ms_tenths as f64) / 10.0;
-            let lines = get_overlay_lines(tenths, ms, draws as f64, limit, menu_open, focused_row);
+            let lines = get_overlay_lines(tenths, ms, draws as f64, current_frame, limit, menu_open, focused_row);
             let (w, h, lit, hl) = bitmap(&lines, scale);
             let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
             let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
@@ -1302,8 +1308,9 @@ mod tests {
 
     #[test]
     fn dropdown_overlay_lines_render_all_sections() {
-        let lines = get_overlay_lines(300, 33.3, 21.0, 30, true, 0);
+        let lines = get_overlay_lines(300, 33.3, 21.0, 100, 30, true, 0);
         assert!(lines[1].contains("DROPDOWN MENU"));
+        assert!(lines[2].contains("FRAME: 100"));
         assert!(lines.iter().any(|l| l.contains("RESOLUTION")));
         assert!(lines.iter().any(|l| l.contains("1200p")));
         assert!(lines.iter().any(|l| l.contains("1080p")));
@@ -1326,9 +1333,10 @@ mod tests {
 
     #[test]
     fn dropdown_closed_renders_concise_hud() {
-        let lines = get_overlay_lines(300, 33.3, 21.0, 30, false, 0);
+        let lines = get_overlay_lines(300, 33.3, 21.0, 100, 30, false, 0);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("SCARLETT HUD"));
+        assert!(lines[0].contains("FRAME: 100"));
         assert!(lines[0].contains("1920x1200"));
         assert!(lines[0].contains("[F2: MENU]"));
         assert!(lines[0].contains("[F3: HIDE]"));

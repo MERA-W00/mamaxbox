@@ -68,7 +68,7 @@ impl Pending {
         }
     }
 
-    fn make(&self) {
+    fn make(self: &Arc<Self>) {
         // Not through `OnceLock::get_or_init`: a worker the driver's compiler
         // crashed under stays inside the call for good (see [`guard_start`]),
         // and anyone else asking would wait for it forever.
@@ -135,6 +135,7 @@ fn guard_on() -> bool {
 
 const MAX_SLOTS: usize = 128;
 static CRASHED: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
+static ACTIVE_SLOTS: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
 static FAULT_CODE: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
 static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
 static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
@@ -144,6 +145,7 @@ static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
 struct ActiveJob {
     key: String,
     shaders: Vec<Arc<Shader>>,
+    pending: Arc<Pending>,
 }
 
 static ACTIVE_JOBS: Mutex<Vec<Option<ActiveJob>>> = Mutex::new(Vec::new());
@@ -169,7 +171,7 @@ struct Compile {
 }
 
 impl Compile {
-    fn begin(slot: usize, p: &Pending) -> Compile {
+    fn begin(slot: usize, p: &Arc<Pending>) -> Compile {
         if slot < MAX_SLOTS && guard_on() {
             let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if jobs.len() < MAX_SLOTS {
@@ -178,8 +180,10 @@ impl Compile {
             jobs[slot] = Some(ActiveJob {
                 key: p.key.clone(),
                 shaders: p.shaders.clone(),
+                pending: p.clone(),
             });
-            COMPILING.set(true);
+            ACTIVE_SLOTS[slot].store(true, Ordering::Release);
+            let _ = COMPILING.try_with(|c| c.set(true));
         }
         Compile { slot }
     }
@@ -187,7 +191,9 @@ impl Compile {
 
 impl Drop for Compile {
     fn drop(&mut self) {
-        if COMPILING.replace(false) && self.slot < MAX_SLOTS {
+        let compiling = COMPILING.try_with(|c| c.replace(false)).unwrap_or(false);
+        if compiling && self.slot < MAX_SLOTS {
+            ACTIVE_SLOTS[self.slot].store(false, Ordering::Release);
             let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(job) = jobs.get_mut(self.slot) {
                 *job = None;
@@ -245,14 +251,27 @@ unsafe extern "system" fn compiler_crashed(
     if !is_av && !is_sigill {
         return CONTINUE_SEARCH;
     }
-    if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
-        return CONTINUE_SEARCH;
-    }
-    let slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
-    if slot >= MAX_SLOTS {
-        return CONTINUE_SEARCH;
+    let mut slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
+    let compiling_on_thread = COMPILING.try_with(|c| c.get()).unwrap_or(false);
+    if !compiling_on_thread || slot >= MAX_SLOTS {
+        // Exception occurred on a driver helper thread (e.g. libnvidia-gpucomp.so)
+        // or a thread without WORKER_SLOT set. Check if any worker is actively compiling.
+        let mut active_slot = usize::MAX;
+        let mut active_count = 0;
+        for s in 0..MAX_SLOTS {
+            if ACTIVE_SLOTS[s].load(Ordering::Acquire) {
+                active_count += 1;
+                active_slot = s;
+            }
+        }
+        if active_count == 0 {
+            // No pipeline compilation in flight: this is an unrelated exception.
+            return CONTINUE_SEARCH;
+        }
+        slot = active_slot;
     }
     let _ = COMPILING.try_with(|c| c.set(false));
+    ACTIVE_SLOTS[slot].store(false, Ordering::Release);
     FAULT_CODE[slot].store(record.ExceptionCode as u32 as u64, Ordering::Relaxed);
     let addr = if record.NumberParameters >= 2 { record.ExceptionInformation[1] as u64 } else { 0 };
     FAULT_ADDR[slot].store(addr, Ordering::Relaxed);
@@ -304,17 +323,19 @@ fn lost(slot: usize) {
     let known = bad_keys(|keys| !keys.insert(job.key.clone()));
     if !known && let Some(dir) = super::library::folder() {
         use std::io::Write;
+        let _ = std::fs::create_dir_all(&dir);
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
             let _ = writeln!(f, "{} ended the compiler in a run: {:?}", job.key, job.shaders);
         }
     }
+    let _ = job.pending.made.set(None);
     {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
-    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+    if dec_waiting() {
         drained();
     }
     if !spawn_worker() {
@@ -363,6 +384,19 @@ fn wait_budget() -> Duration {
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
+
+fn dec_waiting() -> bool {
+    let mut current = WAITING.load(Ordering::Relaxed);
+    loop {
+        if current == 0 {
+            return false;
+        }
+        match WAITING.compare_exchange_weak(current, current - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return current == 1,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
@@ -602,13 +636,18 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 8, or VICTORY_PIPELINE_WORKERS) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = if let Some(val) = std::env::var_os("VICTORY_PIPELINE_WORKERS") {
+            val.to_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 16)
+        } else {
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        };
         guard_start();
+        tracing::info!(workers, "starting pipeline workers");
         for _ in 0..workers {
             if spawn_worker() {
                 running = true;
@@ -622,6 +661,7 @@ fn spawn_worker() -> bool {
     let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{slot}"))
+        .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             WORKER_SLOT.set(slot);
             // Below the title's own threads (loading, recording).
@@ -633,7 +673,7 @@ fn spawn_worker() -> bool {
             loop {
                 let p = next();
                 p.make();
-                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                if dec_waiting() {
                     drained();
                 } else {
                     super::library::save(false);

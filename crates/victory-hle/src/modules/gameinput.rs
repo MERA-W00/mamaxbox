@@ -1200,44 +1200,66 @@ mod host {
             init_linux_pad();
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+            let mut pad = if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
                 self.empty_until[slot] = None;
-                let pad = convert(&state.Gamepad);
-                if pad.buttons != 0 {
-                    victory_core::input_status::set_last_button(pad.buttons);
-                }
-                return Some(pad);
-            }
+                Some(convert(&state.Gamepad))
+            } else {
+                None
+            };
 
-            // Direct PS5 / Linux joystick fallback for Slot 0 when XInput does not see device
+            // Linux joystick, keyboard, and auto-input for Slot 0
             if slot == 0 {
+                let mut extra_buttons = 0;
+                let mut extra_axes = false;
+                let mut lx = 0.0f32;
+                let mut ly = 0.0f32;
+                let mut rx = 0.0f32;
+                let mut ry = 0.0f32;
+                let mut lt = 0.0f32;
+                let mut rt = 0.0f32;
+
                 if LINUX_PAD_CONNECTED.load(Ordering::Relaxed) {
                     if let Ok(lock) = LINUX_PAD_STATE.lock() {
-                        if let Some(pad) = *lock {
-                            return Some(pad);
+                        if let Some(lpad) = *lock {
+                            extra_buttons |= lpad.buttons;
+                            if lpad.left_x != 0.0
+                                || lpad.left_y != 0.0
+                                || lpad.right_x != 0.0
+                                || lpad.right_y != 0.0
+                                || lpad.left_trigger != 0.0
+                                || lpad.right_trigger != 0.0
+                            {
+                                extra_axes = true;
+                                lx = lpad.left_x;
+                                ly = lpad.left_y;
+                                rx = lpad.right_x;
+                                ry = lpad.right_y;
+                                lt = lpad.left_trigger;
+                                rt = lpad.right_trigger;
+                            }
                         }
                     }
                 }
 
-                // Keyboard fallback for Slot 0 when focused (Enter/Space = A, Backspace/Esc = B)
+                // Keyboard fallback for Slot 0 when focused (Enter/Space = A, Backspace/Esc = B, X = X, Y = Y)
                 if focused() {
                     let enter = unsafe { (GetAsyncKeyState(0x0D) as u16 & 0x8000) != 0 };
                     let space = unsafe { (GetAsyncKeyState(0x20) as u16 & 0x8000) != 0 };
                     let back = unsafe { (GetAsyncKeyState(0x08) as u16 & 0x8000) != 0 };
                     let esc = unsafe { (GetAsyncKeyState(0x1B) as u16 & 0x8000) != 0 };
-                    if enter || space || back || esc {
-                        let mut buttons = 0;
-                        if enter || space {
-                            buttons |= A;
-                        }
-                        if back || esc {
-                            buttons |= B;
-                        }
-                        victory_core::input_status::set_last_button(buttons);
-                        return Some(PadState {
-                            buttons,
-                            ..Default::default()
-                        });
+                    let key_x = unsafe { (GetAsyncKeyState(b'X' as i32) as u16 & 0x8000) != 0 };
+                    let key_y = unsafe { (GetAsyncKeyState(b'Y' as i32) as u16 & 0x8000) != 0 };
+                    if enter || space {
+                        extra_buttons |= A;
+                    }
+                    if back || esc {
+                        extra_buttons |= B;
+                    }
+                    if key_x {
+                        extra_buttons |= X;
+                    }
+                    if key_y {
+                        extra_buttons |= Y;
                     }
                 }
 
@@ -1247,13 +1269,41 @@ mod host {
                     static START: OnceLock<Instant> = OnceLock::new();
                     let elapsed = START.get_or_init(Instant::now).elapsed();
                     if elapsed > Duration::from_secs(5) && (elapsed.as_millis() % 1500) < 200 {
-                        victory_core::input_status::set_last_button(A);
-                        return Some(PadState {
-                            buttons: A,
-                            ..Default::default()
-                        });
+                        extra_buttons |= A;
                     }
                 }
+
+                if extra_buttons != 0 || extra_axes {
+                    let p = pad.get_or_insert_with(PadState::default);
+                    p.buttons |= extra_buttons;
+                    if extra_axes {
+                        if p.left_x == 0.0 {
+                            p.left_x = lx;
+                        }
+                        if p.left_y == 0.0 {
+                            p.left_y = ly;
+                        }
+                        if p.right_x == 0.0 {
+                            p.right_x = rx;
+                        }
+                        if p.right_y == 0.0 {
+                            p.right_y = ry;
+                        }
+                        if p.left_trigger == 0.0 {
+                            p.left_trigger = lt;
+                        }
+                        if p.right_trigger == 0.0 {
+                            p.right_trigger = rt;
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref p) = pad {
+                if p.buttons != 0 {
+                    victory_core::input_status::set_last_button(p.buttons);
+                }
+                return pad;
             }
 
             self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);

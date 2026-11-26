@@ -79,18 +79,41 @@ def send_wtype_key(key: str):
 def focus_game_window():
     """Focus game window in Hyprland compositor."""
     try:
-        out = subprocess.check_output(["hyprctl", "clients"], text=True)
-        # Look for window title or class
-        for line in out.splitlines():
-            if "Grand Theft Auto VI" in line or "VIctory" in line:
-                pass
-        # Focus whatever is top or switch
-        subprocess.run(["hyprctl", "dispatch", "focuswindow", "title:Grand Theft Auto VI"], stderr=subprocess.DEVNULL)
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", "title:Americas"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", "class:steam_proton"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
 
-def run_debug_cycle(max_wait_seconds=60):
+def get_game_window_geom():
+    """Get (x, y, w, h) for the game window from hyprctl."""
+    try:
+        out = subprocess.check_output(["hyprctl", "clients"], text=True)
+        is_game = False
+        at = None
+        size = None
+        for line in out.splitlines():
+            line_str = line.strip()
+            if "Window " in line_str:
+                is_game = False
+                at = None
+                size = None
+            if "title: Americas" in line_str or "class: steam_proton" in line_str or "initialTitle: Americas" in line_str:
+                is_game = True
+            if line_str.startswith("at: "):
+                parts = line_str[4:].split(",")
+                at = (int(parts[0].strip()), int(parts[1].strip()))
+            if line_str.startswith("size: "):
+                parts = line_str[6:].split(",")
+                size = (int(parts[0].strip()), int(parts[1].strip()))
+            if is_game and at and size:
+                return f"{at[0]},{at[1]} {size[0]}x{size[1]}"
+    except Exception:
+        pass
+    return None
+
+
+def run_debug_cycle(max_wait_seconds=600):
     print("\n" + "=" * 65)
     print("=== Starting Recursive Debug Cycle for MamaXbox ===")
     print("=" * 65)
@@ -111,7 +134,8 @@ def run_debug_cycle(max_wait_seconds=60):
     env["VICTORY_WINDOW_UPLOAD"] = "1"
     env["VICTORY_TEXTURE_SWEEP"] = "0"
     env["VICTORY_CARD_ACCOUNTING"] = "1"
-    env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148,2486510c8afeef34"
+    env["VICTORY_PIPELINE_WORKERS"] = "4"
+    env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148,2486510c8afeef34,f607be37ee4fba77,656fdcac1e85f2ea,dc33a831d92addd1,88994c3496045f51,02384a60fda6f2d0,13dfdd3b1136e407"
 
     print(f"[Supervisor] Launching {LAUNCHER}...", file=sys.stderr)
     proc = subprocess.Popen([LAUNCHER], env=env, preexec_fn=os.setsid)
@@ -119,6 +143,7 @@ def run_debug_cycle(max_wait_seconds=60):
     screen_opened = False
     start_time = time.time()
     last_click_time = 0.0
+    last_shot_time = 0.0
     menu_loaded = False
     last_log_size = 0
 
@@ -141,13 +166,44 @@ def run_debug_cycle(max_wait_seconds=60):
                     screen_opened = True
                     print(f"[Supervisor] Screen opened and presenting frames! Beginning A/X input clicks...", file=sys.stderr)
 
-                # Check for menu loaded indications
-                if screen_opened and ("menu" in text.lower() or "first world frame" in text or "frame=3000" in text):
-                    print(f"[Supervisor] Menu / game flow loading confirmed!", file=sys.stderr)
-                    menu_loaded = True
+                # Check for driver crashes or compiler errors in new text
+                for line in new_text.splitlines():
+                    if "driver shader compiler crashed" in line or "SIGILL" in line:
+                        print(f"[Supervisor CRASH] {line}", file=sys.stderr)
+
+                # Check for true world frame loading
+                if screen_opened and ("story000" in text or "frame=2048" in text or "frame=4096" in text or "300 draws/frame" in text):
+                    if not menu_loaded:
+                        print(f"[Supervisor] Advanced into story000 world streaming!", file=sys.stderr)
+                        menu_loaded = True
+
+            now = time.time()
+            # If screen is open, capture screen and run OCR periodically
+            if screen_opened and (now - last_shot_time >= 5.0):
+                last_shot_time = now
+                try:
+                    geom = get_game_window_geom()
+                    if geom:
+                        subprocess.run(["grim", "-g", geom, "/tmp/gta6_screen_latest.png"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.run(["grim", "/tmp/gta6_screen_latest.png"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    # Copy latest capture to conversation artifact directory
+                    artifact_path = Path("/home/asiel/.gemini/antigravity-cli/brain/7e79563a-32f0-4488-843e-b0f24670ac94/gta6_game_screen.png")
+                    if Path("/tmp/gta6_screen_latest.png").exists():
+                        import shutil
+                        shutil.copyfile("/tmp/gta6_screen_latest.png", artifact_path)
+
+                    subprocess.run(["tesseract", "/tmp/gta6_screen_latest.png", "/tmp/gta6_ocr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    ocr_text = Path("/tmp/gta6_ocr.txt").read_text(errors="replace").strip()
+                    cleaned_lines = [l.strip() for l in ocr_text.splitlines() if l.strip() and not l.startswith("SCARLETT HUD")]
+                    if cleaned_lines:
+                        sample = " | ".join(cleaned_lines[:4])
+                        print(f"[Screen OCR t+{now - start_time:.0f}s] {sample}", file=sys.stderr)
+                except Exception:
+                    pass
 
             # If screen is open, pulse A / X periodically
-            now = time.time()
             if screen_opened and (now - last_click_time >= 1.5):
                 last_click_time = now
                 print(f"[Supervisor] Sending A/X input (wtype Return + UDP 0x4) at t+{now - start_time:.1f}s", file=sys.stderr)
