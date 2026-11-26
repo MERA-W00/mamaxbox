@@ -1080,7 +1080,7 @@ pub(crate) fn module() -> HleModule {
 #[cfg(windows)]
 mod host {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -1210,10 +1210,48 @@ mod host {
             }
 
             // Direct PS5 / Linux joystick fallback for Slot 0 when XInput does not see device
-            if slot == 0 && LINUX_PAD_CONNECTED.load(Ordering::Relaxed) {
-                if let Ok(lock) = LINUX_PAD_STATE.lock() {
-                    if let Some(pad) = *lock {
-                        return Some(pad);
+            if slot == 0 {
+                if LINUX_PAD_CONNECTED.load(Ordering::Relaxed) {
+                    if let Ok(lock) = LINUX_PAD_STATE.lock() {
+                        if let Some(pad) = *lock {
+                            return Some(pad);
+                        }
+                    }
+                }
+
+                // Keyboard fallback for Slot 0 when focused (Enter/Space = A, Backspace/Esc = B)
+                if focused() {
+                    let enter = unsafe { (GetAsyncKeyState(0x0D) as u16 & 0x8000) != 0 };
+                    let space = unsafe { (GetAsyncKeyState(0x20) as u16 & 0x8000) != 0 };
+                    let back = unsafe { (GetAsyncKeyState(0x08) as u16 & 0x8000) != 0 };
+                    let esc = unsafe { (GetAsyncKeyState(0x1B) as u16 & 0x8000) != 0 };
+                    if enter || space || back || esc {
+                        let mut buttons = 0;
+                        if enter || space {
+                            buttons |= A;
+                        }
+                        if back || esc {
+                            buttons |= B;
+                        }
+                        victory_core::input_status::set_last_button(buttons);
+                        return Some(PadState {
+                            buttons,
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                // Automatic A pulse when VICTORY_AUTO_A is set (starts at 5s, pulses 200ms every 1.5s)
+                static AUTO_A: OnceLock<bool> = OnceLock::new();
+                if *AUTO_A.get_or_init(|| std::env::var_os("VICTORY_AUTO_A").is_some_and(|v| v != "0")) {
+                    static START: OnceLock<Instant> = OnceLock::new();
+                    let elapsed = START.get_or_init(Instant::now).elapsed();
+                    if elapsed > Duration::from_secs(5) && (elapsed.as_millis() % 1500) < 200 {
+                        victory_core::input_status::set_last_button(A);
+                        return Some(PadState {
+                            buttons: A,
+                            ..Default::default()
+                        });
                     }
                 }
             }
