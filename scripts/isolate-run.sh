@@ -65,6 +65,7 @@ if [ $# -eq 0 ]; then
 fi
 
 # Check if we are already inside an isolated netns (no external interfaces and 0 routes)
+export WINEDLLOVERRIDES="conhost.exe=d;wineconsole.exe=d;${WINEDLLOVERRIDES:-}"
 non_lo_ifaces=$(grep -v "lo:" /proc/net/dev 2>/dev/null | tail -n +3 | awk -F: '{print $1}' | tr -d ' ' || true)
 route_cnt=$(tail -n +2 /proc/net/route 2>/dev/null | wc -l || echo 0)
 

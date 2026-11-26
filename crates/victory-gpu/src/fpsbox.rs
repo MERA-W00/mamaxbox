@@ -735,14 +735,23 @@ pub(crate) fn draw(
         return;
     };
 
-    let margin = 4 * scale;
-    if m.width + 2 * margin > width || m.height + 2 * margin > height {
+    let margin_x = (8 * scale).min(32);
+    let margin_y = (6 * scale).min(24);
+    if m.width + 2 * margin_x > width || m.height + 2 * margin_y > height {
         return;
     }
 
-    // Top-right alignment calculation
-    let x_pos = width.saturating_sub(m.width + margin);
-    let y_pos = margin;
+    // Top-right alignment calculation by default, with environmental placement override
+    let hud_pos = std::env::var("VICTORY_HUD_POS").unwrap_or_else(|_| "top-right".to_string());
+    let (x_pos, y_pos) = match hud_pos.as_str() {
+        "top-left" => (margin_x, margin_y),
+        "bottom-left" => (margin_x, height.saturating_sub(m.height + margin_y)),
+        "bottom-right" => (
+            width.saturating_sub(m.width + margin_x),
+            height.saturating_sub(m.height + margin_y),
+        ),
+        _ => (width.saturating_sub(m.width + margin_x), margin_y), // Top-right (default)
+    };
 
     // SAFETY: D3D12 texture copy from mapped buffer to backbuffer.
     unsafe {
@@ -805,5 +814,23 @@ mod tests {
         assert!(w > 0 && h > 0);
         assert_eq!(lit.len(), (w * h) as usize);
         assert!(hl.iter().any(|&b| b));
+    }
+
+    #[test]
+    fn top_right_position_within_bounds() {
+        let screen_w = 1920u32;
+        let screen_h = 1200u32;
+        let overlay_w = 408u32;
+        let overlay_h = 300u32;
+        let margin_x = 16u32;
+        let margin_y = 12u32;
+
+        let x_pos = screen_w.saturating_sub(overlay_w + margin_x);
+        let y_pos = margin_y;
+
+        assert!(x_pos + overlay_w <= screen_w);
+        assert!(y_pos + overlay_h <= screen_h);
+        assert_eq!(x_pos, 1496);
+        assert_eq!(y_pos, 12);
     }
 }
