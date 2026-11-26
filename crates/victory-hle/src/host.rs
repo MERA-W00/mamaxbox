@@ -121,22 +121,116 @@ mod imp {
     }
 
     fn module(dll: &str) -> Option<usize> {
-        let key = dll.to_ascii_lowercase();
-        let mut cache = MODULES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&m) = cache.get(&key) {
-            return Some(m);
+        static UNLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let unlocked = *UNLOCK
+            .get_or_init(|| std::env::var_os("VICTORY_UNLOCK_DLL_LOAD").is_some_and(|v| v == "1"));
+        cached_module(
+            &MODULES,
+            dll.to_ascii_lowercase(),
+            unlocked,
+            load,
+            |extra| {
+                // SAFETY: our concurrent LoadLibraryExA acquired this extra reference.
+                unsafe { windows_sys::Win32::Foundation::FreeLibrary(extra as _) };
+            },
+        )
+    }
+
+    /// Loading a DLL can run callbacks under the Windows loader lock. Releasing the cache
+    /// lock during a load lets those callbacks look up an import on another thread.
+    fn cached_module(
+        modules: &Mutex<HashMap<String, usize>>,
+        key: String,
+        unlocked: bool,
+        load: impl FnOnce(&str) -> Option<usize>,
+        release: impl FnOnce(usize),
+    ) -> Option<usize> {
+        let lock = || modules.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = lock();
+        if let Some(&module) = cache.get(&key) {
+            return Some(module);
         }
-        let name = CString::new(key.as_str()).ok()?;
-        // System32 only: never pick up a same-named DLL from the current folder or PATH.
-        // SAFETY: NUL-terminated DLL name; only allow-listed system DLLs get here.
+        if unlocked {
+            drop(cache);
+            let handle = load(&key)?;
+            cache = lock();
+            if let Some(&module) = cache.get(&key) {
+                drop(cache);
+                release(handle);
+                return Some(module);
+            }
+            cache.insert(key, handle);
+            Some(handle)
+        } else {
+            let handle = load(&key)?;
+            cache.insert(key, handle);
+            Some(handle)
+        }
+    }
+
+    fn load(key: &str) -> Option<usize> {
+        let name = CString::new(key).ok()?;
+        // SAFETY: a NUL-terminated allow-listed name, restricted to System32.
         let handle = unsafe {
             LoadLibraryExA(
                 name.as_ptr().cast(),
                 std::ptr::null_mut(),
                 LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
-        } as usize;
-        (handle != 0).then(|| *cache.entry(key).or_insert(handle))
+        };
+        (!handle.is_null()).then_some(handle as usize)
+    }
+
+    #[cfg(test)]
+    mod cache_tests {
+        use super::*;
+
+        #[test]
+        fn reentrant_publication_releases_only_the_extra_reference() {
+            let cache = Mutex::new(HashMap::new());
+            let mut released = None;
+            let module = cached_module(
+                &cache,
+                "a".into(),
+                true,
+                |_| {
+                    let mut map = cache.try_lock().unwrap();
+                    map.insert("a".into(), 11);
+                    Some(12)
+                },
+                |extra| released = Some(extra),
+            );
+            assert_eq!(module, Some(11));
+            assert_eq!(released, Some(12));
+            assert_eq!(
+                cached_module(&cache, "a".into(), true, |_| panic!(), |_| panic!()),
+                Some(11)
+            );
+        }
+
+        #[test]
+        fn failed_load_is_retryable_and_legacy_load_holds_the_lock() {
+            let cache = Mutex::new(HashMap::new());
+            for unlocked in [true, false] {
+                assert_eq!(
+                    cached_module(
+                        &cache,
+                        "a".into(),
+                        unlocked,
+                        |_| {
+                            assert_eq!(cache.try_lock().is_ok(), unlocked);
+                            None
+                        },
+                        |_| panic!()
+                    ),
+                    None
+                );
+            }
+            assert_eq!(
+                cached_module(&cache, "a".into(), false, |_| Some(42), |_| panic!()),
+                Some(42)
+            );
+        }
     }
 }
 

@@ -1,385 +1,519 @@
-//! Copies of title memory made in place, by this process, with a way back
-//! when a page is not there (`VICTORY_COPY_PLAIN=1`; off by default).
-//!
-//! Every copy of title memory into a host buffer goes through the kernel
-//! (`ReadProcessMemory` on our own process, `crate::host::copy_mapped`):
-//! the title unmaps and remaps its memory while we read it, a read in
-//! place of a page that is gone is an access violation, and the kernel's
-//! copy fails instead. It costs what a system call that locks and probes
-//! every page costs: run 225's profile has the submitting thread 35 ms a
-//! frame inside `ZwReadVirtualMemory` for about 100 MB (3 GB a second),
-//! where the processor's own copy moves that much in a third of the time.
-//!
-//! Here the copy is one `rep movsb` in a function of ours that uses no
-//! stack. An exception handler, first in the line, looks at every access
-//! violation: one that is a READ and happened at exactly that instruction
-//! continues at the function's other exit, which returns 0, and the
-//! caller falls back to the kernel's copy as before (it says which page
-//! is gone and fills in zeros). A write that faults is not ours to take:
-//! the destination is host memory, which is always there; such a fault
-//! goes on to the handlers after this one.
+//! Copies from title memory into a host buffer. On heavy frames the
+//! submitting thread spent 45–50 ms copying about 150 MB. Reading the
+//! same process through the kernel let us survive a concurrent unmap, but
+//! charged that crossing and the kernel's page checks on every good read.
+//! On x64 we can recognize a missing page at one copy instruction and
+//! retry through the kernel. Set `VICTORY_COPY_PLAIN=0` for the old path.
+//! Set `VICTORY_COPY_SMALL=0` to send every read under 256 bytes through
+//! the kernel, including repeated reads of the same page.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".globl victory_copy_guarded",
-    ".globl victory_copy_guarded_at",
-    ".globl victory_copy_guarded_fault",
-    "victory_copy_guarded:",
-    // rcx: to, rdx: from, r8: bytes. rsi and rdi are the caller's: kept in
-    // r9 and r10, which are ours to use, so nothing is on the stack.
-    "    mov r9, rsi",
-    "    mov r10, rdi",
-    "    mov rdi, rcx",
-    "    mov rsi, rdx",
-    "    mov rcx, r8",
-    "victory_copy_guarded_at:",
-    "    rep movsb",
-    "    mov rsi, r9",
-    "    mov rdi, r10",
-    "    mov eax, 1",
-    "    ret",
-    "victory_copy_guarded_fault:",
-    "    mov rsi, r9",
-    "    mov rdi, r10",
-    "    xor eax, eax",
-    "    ret",
-);
-
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" {
-    fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
-    static victory_copy_guarded_at: u8;
-    static victory_copy_guarded_fault: u8;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Path {
+    Plain,
+    Fault,
+    Small,
+    Cooling,
+    Disabled,
 }
 
-/// Whether copies of title memory into host memory are made in place
-/// (`VICTORY_COPY_PLAIN=1`).
-pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
-        if on {
-            install();
-            tracing::info!(
-                "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
-                 page that is not there (VICTORY_COPY_PLAIN=1)"
-            );
+static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// One count per requested host read. The kernel may split a failed read
+/// into several smaller ones to fill holes. Those retries belong to the
+/// same request on the frame line.
+pub(crate) fn per_frame(frames: f64) -> [f64; 5] {
+    COUNTS
+        .each_ref()
+        .map(|n| n.swap(0, Relaxed) as f64 / frames)
+}
+
+/// Returns true when all bytes were copied. A fault retries the original
+/// range through the kernel, including any prefix the processor wrote.
+///
+/// # Safety
+/// `dst` must be a writable host allocation for `len` bytes, disjoint
+/// from title memory. The title may change or unmap `src` during the read.
+pub(crate) unsafe fn read(src: *const u8, dst: *mut u8, len: usize, kernel: impl FnOnce() -> bool) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let path = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_COPY_PLAIN").is_none_or(|v| v != "0") && x64::install()
+        }) {
+            // SAFETY: the caller supplies the host buffer and the fault handler is installed.
+            unsafe { x64::attempt(src, dst, len, &x64::FAULTS) }
+        } else {
+            Path::Disabled
         }
-        on
-    })
-}
-
-/// Copies made in place, their bytes, the copies that met a page that was
-/// not there (and went to the kernel's copy), and the copies not tried in
-/// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line; and the fills of under
-/// [`LEAST`] bytes made in place ([`copy_short`]).
-static COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
-
-/// The fewest bytes copied in place. A read of a byte or a word is how the
-/// layer ASKS whether a page is there (a texture's first page, a record):
-/// it is expected to fail, and a failed kernel read costs a microsecond
-/// where a fault and its handler cost tens (run 230: 1,000 to 1,300 faults
-/// a frame, nearly all of them such askings, took back most of what the
-/// copies in place had won).
-const LEAST: usize = 256;
-
-/// The 64 KiB blocks of title memory a copy in place faulted in lately:
-/// their copies go straight to the kernel's, which reads round the hole.
-/// By the block's number, in the place its low bits name (a later block
-/// with the same low bits takes the place). Forgotten every two seconds:
-/// the title maps the memory in the end.
-static RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
-/// When [`RECENT`] was last emptied (milliseconds of [`now_ms`]).
-static EMPTIED: AtomicU64 = AtomicU64::new(0);
-
-fn now_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-}
-
-/// The numbers of the first and last 64 KiB block of `[from, from + len)`,
-/// never 0 (0 is an empty place).
-fn blocks(from: usize, len: usize) -> (usize, usize) {
-    ((from >> 16) | 1 << 63, ((from + len.max(1) - 1) >> 16) | 1 << 63)
-}
-
-/// Whether a copy from there faulted lately.
-fn faulted_lately(from: usize, len: usize) -> bool {
-    let now = now_ms();
-    let emptied = EMPTIED.load(Relaxed);
-    if now.saturating_sub(emptied) >= 2_000 && EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
-        for place in &RECENT {
-            place.store(0, Relaxed);
-        }
-        return false;
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let path = Path::Disabled;
+    COUNTS[path as usize].fetch_add(1, Relaxed);
+    if path == Path::Plain {
+        return true;
     }
-    let (first, last) = blocks(from, len);
-    RECENT[first & 1023].load(Relaxed) == first || RECENT[last & 1023].load(Relaxed) == last
+    let copied = kernel();
+    #[cfg(target_arch = "x86_64")]
+    if path != Path::Disabled {
+        x64::note_kernel_read(src, len, copied);
+    }
+    copied
 }
 
-/// A copy from there faulted.
-fn note_fault(from: usize, len: usize) {
-    let (first, last) = blocks(from, len);
-    RECENT[first & 1023].store(first, Relaxed);
-    RECENT[last & 1023].store(last, Relaxed);
-}
-
-/// The handler that turns a read fault inside [`guarded`] into its return
-/// of false; put first in the line, once.
 #[cfg(target_arch = "x86_64")]
-fn install() {
+mod x64 {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::{OnceLock, RwLock};
+    use std::time::Instant;
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+        AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, EXCEPTION_RECORD,
     };
-    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
-        // SAFETY: the system passes the exception being dispatched and the
-        // context it will continue with.
-        let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        // Only at the copy's own instruction.
-        if context.Rip != (&raw const victory_copy_guarded_at) as u64 {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        const READ: usize = 0;
-        let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
-        let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
-        if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-            context.Rip = (&raw const victory_copy_guarded_fault) as u64;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        EXCEPTION_CONTINUE_SEARCH
-    }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: a handler that reads the record it is given and nothing else.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_fault));
-    });
-}
 
-#[cfg(not(target_arch = "x86_64"))]
-fn install() {}
-
-/// Copies `len` bytes from `from` to `to` in place; false if a page of the
-/// source was not there (then some of `to` may have been written).
-///
-/// `to` must be writable memory of `len` bytes that is ours (host memory);
-/// `from` may be anything.
-#[cfg(target_arch = "x86_64")]
-fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
-    install();
-    // SAFETY: the destination is the caller's to write; a source page that
-    // is not there ends the copy with 0 instead of a fault ([`install`]).
-    unsafe { victory_copy_guarded(to, from, len) != 0 }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
-    false
-}
-
-/// With [`on`]: copies title memory at `from` into host memory at `to`;
-/// false if it is off or a source page was not there (the caller then
-/// copies through the kernel, as before).
-pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
-    if !on() {
-        return false;
-    }
-    if len < LEAST {
-        COUNT[4].fetch_add(1, Relaxed);
-        return false;
-    }
-    if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
-        return false;
-    }
-    let whole = guarded(to, from, len);
-    if whole {
-        COUNT[0].fetch_add(1, Relaxed);
-        COUNT[1].fetch_add(len as u64, Relaxed);
-    } else {
-        COUNT[2].fetch_add(1, Relaxed);
-        note_fault(from as usize, len);
-    }
-    whole
-}
-
-/// With [`on`]: copies `len` bytes, fewer than [`LEAST`], of title memory
-/// at `from` into host memory at `to`, for a caller that is NOT asking
-/// whether the page is there but expects it to be (a list's fill of upload
-/// memory: constants the title recorded a draw with). False if it is off,
-/// if the source faulted lately, or if a source page was not there; the
-/// caller then copies through the kernel, as before.
-///
-/// Why: the floor of [`copy`] is there for the askings, which fail. The
-/// fills do not: 8,000 to 12,000 of them a frame went to the kernel's copy
-/// (run 279's lines, "of under 256 bytes"), about 400 ns each where the
-/// copy in place of 16 to 128 bytes is about 30 ns (timed on this
-/// processor, 2026-11-25, two million copies each).
-pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
-    if !on() {
-        return false;
-    }
-    if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
-        return false;
-    }
-    let whole = guarded(to, from, len);
-    if whole {
-        COUNT[5].fetch_add(1, Relaxed);
-    } else {
-        COUNT[2].fetch_add(1, Relaxed);
-        note_fault(from as usize, len);
-    }
-    whole
-}
-
-/// The fewest bytes [`copy`] takes: what is shorter is [`copy_short`]'s,
-/// for callers that may use it.
-pub(crate) const fn least() -> usize {
-    LEAST
-}
-
-/// With the frame line: what [`copy`] did per frame over `frames`.
-pub(crate) fn line(frames: f64) {
-    if !on() {
-        return;
-    }
-    let [copies, bytes, gone, lately, small, fills] = [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
-    tracing::info!(
-        "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
-         that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; fills of under {LEAST} bytes made in place \
-         (VICTORY_FILLS_PLAIN): {fills:.0}",
-        bytes / 1e6
+    // RCX, RDX, R8 are destination, source and count in the Windows x64
+    // ABI. Keep unwind information for the caller's RSI and RDI. Either
+    // exit restores them, even after REP has advanced part of the way.
+    core::arch::global_asm!(
+        ".text",
+        ".globl victory_plain_copy",
+        ".globl victory_plain_copy_at",
+        ".globl victory_plain_copy_exit",
+        ".seh_proc victory_plain_copy",
+        "victory_plain_copy:",
+        "push rsi",
+        ".seh_pushreg rsi",
+        "push rdi",
+        ".seh_pushreg rdi",
+        "sub rsp, 8",
+        ".seh_stackalloc 8",
+        ".seh_endprologue",
+        ".seh_handler {unclaimed_guard}, @except",
+        "mov rdi, rcx",
+        "mov rsi, rdx",
+        "mov rcx, r8",
+        "victory_plain_copy_at:",
+        "rep movsb",
+        "xor eax, eax",
+        "victory_plain_copy_exit:",
+        "add rsp, 8",
+        "pop rdi",
+        "pop rsi",
+        "ret",
+        ".seh_endproc",
+        unclaimed_guard = sym unclaimed_guard,
     );
-}
 
-#[cfg(all(test, target_arch = "x86_64"))]
-mod tests {
-    use super::*;
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-    };
-
-    const PAGE: usize = 4096;
-
-    #[test]
-    fn memory_that_is_there_is_copied() {
-        let from: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + 3) as u8).collect();
-        let mut to = vec![0u8; from.len()];
-        assert!(guarded(to.as_mut_ptr(), from.as_ptr(), from.len()));
-        assert_eq!(to, from);
-        // Nothing to copy is a copy.
-        assert!(guarded(to.as_mut_ptr(), from.as_ptr(), 0));
+    unsafe extern "C" {
+        fn victory_plain_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
+        static victory_plain_copy_at: u8;
+        static victory_plain_copy_exit: u8;
     }
 
-    /// A fill's few bytes: copied whole where they are there, up to the last
-    /// byte of a page; a copy that runs into a hole by one byte ends with
-    /// false and the thread goes on.
-    #[test]
-    fn a_short_copy_is_whole_or_ends_without_a_fault() {
-        // SAFETY: memory of the test's own.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
-        assert!(!base.is_null());
-        // SAFETY: the first page of that reservation.
-        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
-        // SAFETY: committed and writable.
-        let page = unsafe { std::slice::from_raw_parts_mut(base, PAGE) };
-        for (i, b) in page.iter_mut().enumerate() {
-            *b = (i * 13 + 5) as u8;
+    /// The view guards in `watch` use PAGE_READONLY. Reading a guarded
+    /// source leaves it armed. A write violation, even at REP MOVSB, must
+    /// reach the write handler so it can open and dirty the block and its
+    /// aliases. The copy handler never changes a protection or takes the
+    /// guard lock. The copy never queries or resets write-watch.
+    fn recover_read(record: &EXCEPTION_RECORD, context: &mut CONTEXT) -> bool {
+        if context.Rip != (&raw const victory_plain_copy_at) as u64
+            || record.NumberParameters < 2
+            || record.ExceptionInformation[0] != 0
+        // read
+        {
+            return false;
         }
-        for len in [1usize, 16, 64, 255] {
-            let mut to = vec![0u8; len];
-            // The page's last bytes.
-            assert!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len), len), "{len}");
-            assert_eq!(to, page[PAGE - len..], "{len}");
-            // One byte into the hole.
-            let mut to = vec![0u8; len];
-            assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len + 1), len), "{len}");
-            assert_eq!(to[..len - 1], page[PAGE - len + 1..], "{len}: the bytes before the hole");
+        // Return the actual faulting 64 KiB block, including a hole in
+        // the middle of a large copy. Zero is the normal, successful exit.
+        context.Rax = (record.ExceptionInformation[1] as u64 >> 16) + 1;
+        context.Rip = (&raw const victory_plain_copy_exit) as u64;
+        true
+    }
+
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: Windows supplies the record and the context to resume.
+        let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        if matches!(
+            record.ExceptionCode,
+            EXCEPTION_ACCESS_VIOLATION | EXCEPTION_IN_PAGE_ERROR
+        ) && recover_read(record, context)
+        {
+            EXCEPTION_CONTINUE_EXECUTION
+        } else {
+            EXCEPTION_CONTINUE_SEARCH
         }
-        // SAFETY: the test's reservation.
-        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
-    /// Three pages reserved, the first committed: a copy that stays in the
-    /// first page is whole; one that runs into the second ends with false,
-    /// the bytes before the hole copied, and the thread goes on.
-    #[test]
-    fn a_page_that_is_not_there_ends_the_copy_without_a_fault() {
-        // SAFETY: memory of the test's own.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
-        assert!(!base.is_null());
-        // SAFETY: the first page of that reservation.
-        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
-        // SAFETY: committed and writable.
-        unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0xAB);
-        let mut to = vec![0u8; 2 * PAGE];
-        assert!(guarded(to.as_mut_ptr(), base, PAGE));
-        assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
-        to.fill(0);
-        assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE / 2), PAGE));
-        assert!(to[..PAGE / 2].iter().all(|&b| b == 0xAB), "the bytes before the hole");
-        assert!(to[PAGE / 2..].iter().all(|&b| b == 0), "nothing after it");
-        // A source that is not there at all.
-        assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE), PAGE));
-        // Committed but closed to reads.
-        // SAFETY: the third page of the reservation.
-        assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_NOACCESS) }.is_null());
-        assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(2 * PAGE), 16));
-        // And the registers the caller owns came back: this still works.
-        assert!(guarded(to.as_mut_ptr(), base, PAGE));
-        assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
-        // SAFETY: the test's reservation.
-        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    /// PAGE_GUARD is a one-shot Windows notification, distinct from the
+    /// engine's read-only guards. Let every vectored handler see it first.
+    /// If none claims a source read, this copy's frame handler can still
+    /// return to the kernel path. A destination guard belongs to its owner.
+    unsafe extern "system" fn unclaimed_guard(
+        record: *const EXCEPTION_RECORD,
+        _frame: *mut std::ffi::c_void,
+        context: *mut CONTEXT,
+        _dispatcher: *mut std::ffi::c_void,
+    ) -> i32 {
+        use windows_sys::Win32::System::Kernel::{
+            ExceptionContinueExecution, ExceptionContinueSearch,
+        };
+        // SAFETY: Windows calls the handler for the assembly frame above.
+        let (record, context) = unsafe { (&*record, &mut *context) };
+        if record.ExceptionCode == EXCEPTION_GUARD_PAGE && recover_read(record, context) {
+            ExceptionContinueExecution
+        } else {
+            ExceptionContinueSearch
+        }
     }
 
-    /// A source that faulted is remembered by its 64 KiB blocks, and only
-    /// those.
-    #[test]
-    fn a_source_that_faulted_is_remembered_by_its_blocks() {
-        // (Addresses no other test uses; the table is shared.)
-        let at = 0x7654_3210_0000usize;
-        assert!(!faulted_lately(at, 4096));
-        note_fault(at + 100, 4096);
-        assert!(faulted_lately(at, 16));
-        assert!(faulted_lately(at + 0xffff, 1));
-        // A copy that ends in the block, and one that begins in it.
-        assert!(faulted_lately(at - 4096, 8192));
-        // The blocks beside it are not remembered.
-        assert!(!faulted_lately(at + 0x10000, 4096));
-        assert!(!faulted_lately(at - 0x10000, 4096));
-        assert_eq!(blocks(0, 0), (1 << 63, 1 << 63));
+    pub(super) fn install() -> bool {
+        static INSTALLED: OnceLock<bool> = OnceLock::new();
+        *INSTALLED.get_or_init(|| {
+            // SAFETY: this function remains loaded for the process lifetime.
+            let installed = !unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) }.is_null();
+            if !installed {
+                tracing::warn!("could not install the plain copy handler, using ReadProcessMemory");
+            }
+            installed
+        })
     }
 
-    /// Many threads at once, half of them faulting: each gets its own answer.
-    #[test]
-    fn threads_fault_and_copy_side_by_side() {
-        // SAFETY: memory of the test's own.
-        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
-        assert_ne!(base, 0);
-        // SAFETY: the first page of that reservation.
-        assert!(!unsafe { VirtualAlloc(base as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
-        let threads: Vec<_> = (0..8)
-            .map(|t| {
-                std::thread::spawn(move || {
-                    let mut to = vec![0u8; PAGE];
-                    for _ in 0..2_000 {
-                        let from = (base + if t % 2 == 0 { 0 } else { PAGE }) as *const u8;
-                        assert_eq!(guarded(to.as_mut_ptr(), from, PAGE), t % 2 == 0);
+    fn now_ms() -> u64 {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    /// Each block gets two seconds from its own fault. A read spanning a
+    /// remembered hole goes directly to the kernel. All copy workers share
+    /// the deadlines, and once the last one passes readers skip the lock.
+    pub(super) struct Faults {
+        latest: AtomicU64,
+        recent: RwLock<Recent>,
+    }
+
+    struct Recent {
+        deadlines: BTreeMap<usize, u64>,
+        prune_at: u64,
+    }
+
+    pub(super) static FAULTS: Faults = Faults::new();
+
+    impl Faults {
+        const fn new() -> Self {
+            Self {
+                latest: AtomicU64::new(0),
+                recent: RwLock::new(Recent {
+                    deadlines: BTreeMap::new(),
+                    prune_at: 0,
+                }),
+            }
+        }
+
+        fn cooling(&self, start: usize, len: usize, now: u64) -> bool {
+            if self.latest.load(Relaxed) <= now {
+                return false;
+            }
+            let blocks = (start >> 16)..=(start.saturating_add(len - 1) >> 16);
+            self.recent
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .deadlines
+                .range(blocks)
+                .any(|(_, until)| *until > now)
+        }
+
+        fn remember(&self, block: usize, now: u64) {
+            let expires = now + 2_000;
+            let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
+            // A burst of faults in different blocks needs one sweep in two
+            // seconds. Readers check each deadline even between sweeps.
+            if now >= recent.prune_at {
+                recent.deadlines.retain(|_, until| *until > now);
+                recent.prune_at = expires;
+            }
+            let until = recent.deadlines.entry(block).or_default();
+            *until = (*until).max(expires);
+            self.latest.fetch_max(*until, Relaxed);
+        }
+    }
+
+    thread_local! {
+        /// Page of this thread's last successful small kernel read. This
+        /// is only a hint to try the protected copy instruction. Bytes and
+        /// access rights are never cached, as the title can write or unmap.
+        static LAST_PAGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn small_reads() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_SMALL").is_none_or(|v| v != "0"))
+    }
+
+    fn small_page(src: *const u8, len: usize) -> Option<usize> {
+        let start = src as usize;
+        let page = start / 4096;
+        (start.checked_add(len - 1)? / 4096 == page).then_some(page)
+    }
+
+    pub(super) fn note_kernel_read(src: *const u8, len: usize, copied: bool) {
+        if (2..256).contains(&len) && small_reads() {
+            LAST_PAGE.set(if copied { small_page(src, len) } else { None });
+        }
+    }
+
+    /// One-byte residency probes produced 1,000-1,300 exceptions a frame
+    /// when tried in place. Only real reads wholly on a recently read page
+    /// may go below 256 bytes. A remap still takes the usual fault path.
+    pub(super) unsafe fn attempt(
+        src: *const u8,
+        dst: *mut u8,
+        len: usize,
+        faults: &Faults,
+    ) -> Path {
+        if len < 256
+            && (len <= 1
+                || !small_reads()
+                || !LAST_PAGE.get().is_some_and(|page| small_page(src, len) == Some(page)))
+        {
+            return Path::Small;
+        }
+        if faults.cooling(src as usize, len, now_ms()) {
+            return Path::Cooling;
+        }
+        // SAFETY: the caller owns the destination and installed the handler.
+        match unsafe { victory_plain_copy(dst, src, len) } {
+            0 => Path::Plain,
+            fault => {
+                faults.remember(fault - 1, now_ms());
+                Path::Fault
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const PAGE: usize = 4096;
+
+        #[test]
+        fn cold_reads_under_256_bytes_stay_with_the_kernel() {
+            assert!(install());
+            LAST_PAGE.set(None);
+            let src = [0xb5; 257];
+            let faults = Faults::new();
+            for n in [0, 1, 255, 256, 257] {
+                let mut dst = [0; 257];
+                // SAFETY: separate arrays, large enough for every read.
+                let path = unsafe { attempt(src.as_ptr(), dst.as_mut_ptr(), n, &faults) };
+                if n < 256 {
+                    assert_eq!(path, Path::Small);
+                    assert_eq!(dst, [0; 257]);
+                } else {
+                    assert_eq!(path, Path::Plain);
+                    assert_eq!(dst[..n], src[..n]);
+                    assert!(dst[n..].iter().all(|&v| v == 0));
+                }
+            }
+        }
+
+        #[test]
+        fn small_reads_on_one_page_fetch_fresh_bytes_and_leave_probes_to_the_kernel() {
+            #[repr(align(4096))]
+            struct Pages([u8; 2 * PAGE]);
+            let mut pages = Pages([0x67; 2 * PAGE]);
+            let src = pages.0.as_mut_ptr();
+            let calls = std::cell::Cell::new(0);
+            let read = |offset: usize, len: usize| {
+                let mut bytes = vec![0; len];
+                let at = src.wrapping_add(offset);
+                let dst = bytes.as_mut_ptr();
+                // SAFETY: separate live buffers. Count the normal kernel fallback.
+                assert!(unsafe {
+                    super::super::read(at, dst, len, || {
+                        calls.set(calls.get() + 1);
+                        ReadProcessMemory(GetCurrentProcess(), at.cast(), dst.cast(), len, std::ptr::null_mut()) != 0
+                    })
+                });
+                bytes
+            };
+            LAST_PAGE.set(None);
+            assert_eq!(read(0, 2), [0x67; 2]);
+            // SAFETY: an ordinary write between the two reads.
+            unsafe { src.add(16).write(0xb5) };
+            assert_eq!(read(16, 12)[0], 0xb5);
+            assert_eq!(read(24, 255), [0x67; 255]);
+            let enabled = small_reads() && std::env::var_os("VICTORY_COPY_PLAIN").is_none_or(|v| v != "0");
+            assert_eq!(calls.get(), if enabled { 1 } else { 3 });
+            let before = calls.get();
+            assert_eq!(read(0, 1), [0x67]);
+            assert_eq!(read(PAGE - 1, 2), [0x67; 2]);
+            assert_eq!(calls.get(), before + 2);
+        }
+
+        #[test]
+        fn a_small_read_with_a_stale_page_hint_recovers_after_an_unmap() {
+            use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+            assert!(install());
+            let mut dst = [0; 8];
+            let faults = Faults::new();
+            // SAFETY: the reservation stays ours throughout. The installed
+            // handler recovers a read of the page after its backing is gone.
+            unsafe {
+                let at = VirtualAlloc(std::ptr::null(), PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                assert!(!at.is_null());
+                assert!(crate::host::read_into(at.cast(), &mut dst));
+                LAST_PAGE.set(Some(at as usize / PAGE));
+                assert_ne!(VirtualFree(at, PAGE, MEM_DECOMMIT), 0);
+                assert_eq!(attempt(at.cast(), dst.as_mut_ptr(), 1, &faults), Path::Small);
+                let path = attempt(at.cast(), dst.as_mut_ptr(), dst.len(), &faults);
+                assert_eq!(path, if small_reads() { Path::Fault } else { Path::Small });
+                if small_reads() {
+                    assert_eq!(attempt(at.cast(), dst.as_mut_ptr(), dst.len(), &faults), Path::Cooling);
+                }
+                assert!(!crate::host::read_into(at.cast(), &mut dst));
+                assert_ne!(VirtualFree(at, 0, MEM_RELEASE), 0);
+            }
+        }
+
+        #[test]
+        fn each_fault_cools_its_own_block_for_two_seconds() {
+            let faults = Faults::new();
+            faults.remember(2, 1_999);
+            faults.remember(4, 3_000);
+            assert!(faults.cooling(1 << 16, 2 << 16, 3_998));
+            assert!(!faults.cooling(1 << 16, 1 << 16, 3_998));
+            assert!(!faults.cooling(2 << 16, 1, 3_999));
+            assert!(faults.cooling(4 << 16, 1, 4_999));
+            assert!(!faults.cooling(4 << 16, 1, 5_000));
+        }
+
+        #[test]
+        fn a_missing_middle_page_retries_the_kernel_and_preserves_both_islands() {
+            const SIZE: usize = 3 * 65536;
+            const HOLE: usize = 65536 + PAGE;
+            assert!(install());
+            let faults = Faults::new();
+            let mut dst = vec![0xcc; SIZE];
+            let mut kernel = vec![0xcc; SIZE];
+            // SAFETY: reserve three blocks and commit all but one interior
+            // page. Only committed ranges are written directly.
+            unsafe {
+                let src =
+                    VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!src.is_null());
+                for (at, n, byte) in [(0, HOLE, 0x47), (HOLE + PAGE, SIZE - HOLE - PAGE, 0xad)] {
+                    assert_eq!(
+                        VirtualAlloc(src.add(at).cast(), n, MEM_COMMIT, PAGE_READWRITE),
+                        src.add(at).cast()
+                    );
+                    src.add(at).write_bytes(byte, n);
+                }
+                assert_eq!(attempt(src, dst.as_mut_ptr(), SIZE, &faults), Path::Fault);
+                assert_eq!(attempt(src, dst.as_mut_ptr(), SIZE, &faults), Path::Cooling);
+                // A read next to the bad block still takes the fast path.
+                assert_eq!(attempt(src, dst.as_mut_ptr(), PAGE, &faults), Path::Plain);
+                let rpm = |at: usize, to: &mut [u8]| {
+                    let mut bytes = 0;
+                    let whole = ReadProcessMemory(
+                        GetCurrentProcess(),
+                        src.add(at).cast(),
+                        to.as_mut_ptr().cast(),
+                        to.len(),
+                        &mut bytes,
+                    ) != 0;
+                    (whole, bytes)
+                };
+                let (whole, bytes) = rpm(0, &mut kernel);
+                assert!(!whole);
+                dst.fill(0xcc);
+                assert_eq!(crate::host::read_into(src, &mut dst), whole);
+                assert_eq!(dst[..bytes], kernel[..bytes]);
+                // Build the old sparse-copy result using only the kernel.
+                for (i, page) in kernel.chunks_exact_mut(PAGE).enumerate() {
+                    if !rpm(i * PAGE, page).0 {
+                        page.fill(0);
                     }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
+                }
+                dst.fill(0xcc);
+                crate::host::copy_mapped(dst.as_mut_ptr(), src, SIZE, false);
+                assert_eq!(dst, kernel);
+                assert_ne!(VirtualFree(src.cast(), 0, MEM_RELEASE), 0);
+            }
         }
-        // SAFETY: the test's reservation.
-        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+
+        #[test]
+        fn reading_a_guarded_view_leaves_the_next_write_for_the_guard_handler() {
+            use crate::watch::{
+                guard,
+                tests::{drop_views, two_views},
+            };
+            const BLOCK: usize = 1 << 16;
+            let (section, view, alias) = two_views(BLOCK);
+            let changes = || guard(view, view + BLOCK).unwrap();
+            assert_eq!(changes(), [view / crate::watch::PAGE]);
+            assert!(install());
+            let faults = Faults::new();
+            let mut dst = [0x7b; 256];
+            // SAFETY: the view is readable. The second copy deliberately
+            // writes its alias at the very same REP instruction. The engine
+            // owns the guard and makes the alias writable on that fault.
+            unsafe {
+                assert_eq!(
+                    attempt(view as *const u8, dst.as_mut_ptr(), dst.len(), &faults),
+                    Path::Plain
+                );
+                assert_eq!(dst, [0; 256]);
+                assert!(changes().is_empty());
+                dst.fill(0x7b);
+                assert_eq!(
+                    attempt(dst.as_ptr(), alias as *mut u8, dst.len(), &faults),
+                    Path::Plain
+                );
+                assert_eq!(changes(), [view / crate::watch::PAGE]);
+                assert_eq!(
+                    std::slice::from_raw_parts(view as *const u8, dst.len()),
+                    dst
+                );
+            }
+            drop_views(section, &[view, alias], BLOCK);
+        }
+
+        #[test]
+        fn an_unclaimed_windows_guard_falls_back_at_the_copy() {
+            assert!(install());
+            let mut dst = [0; PAGE];
+            // SAFETY: a fresh allocation with a one-shot read guard.
+            unsafe {
+                let src = VirtualAlloc(
+                    std::ptr::null(),
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                );
+                assert!(!src.is_null());
+                let mut old = 0;
+                assert_ne!(
+                    VirtualProtect(src, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                    0
+                );
+                assert_eq!(
+                    attempt(src.cast(), dst.as_mut_ptr(), PAGE, &Faults::new()),
+                    Path::Fault
+                );
+                assert_ne!(VirtualFree(src, 0, MEM_RELEASE), 0);
+            }
+        }
     }
 }

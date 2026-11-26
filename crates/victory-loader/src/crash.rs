@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, RtlLookupFunctionEntry,
     RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
@@ -110,6 +110,7 @@ fn title_output() -> String {
 
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
+    crate::console_cpu::configure();
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         unsafe { report_unhandled(info) };
@@ -134,89 +135,25 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
-/// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
-/// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// The kernel provides a live context for the thread that took the exception.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
-    // SAFETY: the system passes valid exception pointers; the faulting
-    // instruction's bytes are readable, as the CPU just fetched them.
     unsafe {
-        let record = &*(*info).ExceptionRecord;
-        let context = &mut *(*info).ContextRecord;
-        if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
-            return false;
-        }
-        let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
-                    // A whole write-back loop in one exception (see `clwb_loop`).
-                    let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
-                    context.Rip += pass.len as u64;
-                    return true;
-                }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
-                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
-                    context.Rip += len as u64;
-                    return true;
-                }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
-                    return false;
-                };
-                context.Rip += len as u64;
-                return true;
-            }
-        }
-        context.Rip += 3;
+        (*(*info).ExceptionRecord).ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION
+            && crate::console_cpu::emulate(&mut *(*info).ContextRecord) == -1
     }
-    true
 }
 
-/// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
-/// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
-        return None;
-    }
-    let modrm = code[at + 2];
-    let (mode, rm) = (modrm >> 6, modrm & 7);
-    if mode == 3 || (modrm >> 3) & 7 != 6 {
-        return None;
-    }
-    let mut len = at + 3;
-    let mut base = rm;
-    if rm == 4 {
-        base = code[len] & 7;
-        len += 1;
-    }
-    len += match mode {
-        0 if rm == 5 || (rm == 4 && base == 5) => 4,
-        1 => 1,
-        2 => 4,
-        _ => 0,
-    };
-    Some(len)
+/// Preserves the existing fast path for counted write-back hints. The decoder
+/// supplies a checked snapshot, and a wrapping counter runs one hint at a time.
+pub(super) fn advance_writebacks(context: &mut CONTEXT, code: &[u8]) -> Option<(usize, u64)> {
+    let pass = clwb_loop(code)?;
+    let limit = *gpr(context, pass.limit);
+    let base = gpr(context, pass.base);
+    let lines = if *base <= limit { (limit - *base) / 64 + 1 } else { 1 };
+    let last = base.checked_add(lines.checked_mul(64)?)?;
+    *base = last;
+    context.EFlags = (context.EFlags & !CMP_FLAGS) | cmp_flags(last, limit);
+    Some((pass.len, lines))
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -278,7 +215,7 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 }
 
 /// The general register numbered `n` as instructions encode it.
-fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
+pub(super) fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
     match n & 15 {
         0 => &mut context.Rax,
         1 => &mut context.Rcx,
@@ -311,61 +248,7 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 }
 const CMP_FLAGS: u32 = 0x8d5;
 
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
-        return None;
-    }
-    let modrm = b(at + 2);
-    if modrm >> 6 != 3 {
-        return None;
-    }
-    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
-    let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
-    let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
-    } else {
-        // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
-        ((f as u8, (f >> 8) as u8), at + 3)
-    };
-    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
-    let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    if prefix == 0x66 {
-        // extrq: register form takes its fields from src, works on dst.
-        if immediate && (modrm >> 3) & 7 != 0 {
-            return None;
-        }
-        let target = if immediate { src } else { dst };
-        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-    } else {
-        let value = (xmm[src].Low & mask) << at_bit;
-        xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
-    }
-    Some(len)
-}
-
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // an instruction of the console's CPU this one lacks: emulated, the title goes on
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
-        // SAFETY: the faulting thread's context, for the exception being dispatched.
-        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
-        if r != 0 {
-            return r;
-        }
-    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
@@ -388,19 +271,12 @@ pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     unsafe { report("unhandled exception", info, true) };
 }
 
-/// The bytes at `at` as hex, as many as the longest x86 instruction (15),
-/// but none past the end of `at`'s page: the next page may not be mapped.
-/// For an instruction the CPU refused, they name it (`0f 01 fd` is
-/// `rdpru`), which the address alone does not.
-///
-/// # Safety
-/// `at`'s page is readable.
-unsafe fn instruction_bytes(at: usize) -> String {
-    let n = (0x1000 - (at & 0xfff)).min(15);
-    // SAFETY: `n` bytes from `at` stay inside its page, which the caller
-    // says is readable.
-    let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, n) };
-    let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+/// Prints up to 15 readable instruction bytes on the faulting page.
+fn instruction_bytes(at: usize) -> String {
+    let mut bytes = [0; 15];
+    let room = (4096 - (at & 4095)).min(bytes.len());
+    let n = crate::console_cpu::read_code(at, &mut bytes[..room]);
+    let hex: Vec<_> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
     hex.join(" ")
 }
 
@@ -466,8 +342,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
     } else if code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION {
-        // SAFETY: the CPU refused the instruction at `at`, so it fetched it.
-        format!(" (code {})", unsafe { instruction_bytes(at) })
+        format!(" (code {})", instruction_bytes(at))
     } else {
         String::new()
     };
@@ -662,7 +537,7 @@ fn memory_at(address: usize) -> String {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
+        EXCEPTION_RECORD, M128A, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
     #[test]
@@ -760,6 +635,7 @@ mod tests {
 
     #[test]
     fn clwb_lengths() {
+        use crate::console_cpu::clwb_len;
         let pad = |b: &[u8]| {
             let mut c = [0u8; 15];
             c[..b.len()].copy_from_slice(b);
@@ -783,35 +659,51 @@ mod tests {
     }
 
     #[test]
-    fn clzero_zeroes_its_line_on_any_cpu() {
+    fn missing_instructions_resume_under_the_vectored_handler() {
+        use std::arch::x86_64::__cpuid;
+        let highest = __cpuid(0x8000_0000).eax;
+        let has_clzero = highest >= 0x8000_0008 && __cpuid(0x8000_0008).ebx & 1 != 0;
+        let has_sse4a = highest >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 6) != 0;
         report_crashes();
-        #[repr(align(64))]
-        struct Line([u8; 128]);
-        let mut line = Line([0xff; 128]);
-        let at = line.0.as_mut_ptr().wrapping_add(5); // inside the first line
-        // SAFETY: clzero writes only the 64-byte line holding `at`, ours.
-        unsafe { std::arch::asm!(".byte 0x0f, 0x01, 0xfc", in("rax") at) };
-        assert!(line.0[..64].iter().all(|&b| b == 0));
-        assert!(line.0[64..].iter().all(|&b| b == 0xff));
-        // insertq xmm0, xmm1, len 16, at 16; then extrq xmm0, len 8, at 20.
-        let out: u64;
-        // SAFETY: touches only the named registers.
-        unsafe {
-            std::arch::asm!(
-                "movq xmm0, {a}", "movq xmm1, {b}",
-                ".byte 0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10",
-                "movq {a}, xmm0",
-                ".byte 0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14",
-                "movq {b}, xmm0",
-                a = inout(reg) 0x1111_2222_3333_4444u64 => _, b = inout(reg) 0xabcdu64 => out,
-                out("xmm0") _, out("xmm1") _)
-        };
-        assert_eq!(out, 0xbc); // 0x1111_2222_abcd_4444 >> 20, 8 bits
-        // SAFETY: monitorx/mwaitx are wait hints that write no memory.
-        unsafe {
-            std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
-                in("rax") at, in("ecx") 0, in("edx") 0)
-        };
+        if !has_clzero {
+            #[repr(align(64))]
+            struct Line([u8; 128]);
+            let mut line = Line([0xff; 128]);
+            let at = line.0.as_mut_ptr().wrapping_add(5);
+            // SAFETY: the line containing this address belongs to the test.
+            unsafe { std::arch::asm!(".byte 0x0f, 0x01, 0xfc", "nop", in("rax") at) };
+            assert!(line.0[..64].iter().all(|&b| b == 0));
+            assert!(line.0[64..].iter().all(|&b| b == 0xff));
+            eprintln!("VEH test exercised CLZERO");
+        } else {
+            eprintln!("SKIP native CLZERO");
+        }
+        if !has_sse4a {
+            let out: u64;
+            // SAFETY: the two instructions modify only the declared XMM registers.
+            unsafe {
+                std::arch::asm!(
+                    "movq xmm0, {a}", "movq xmm1, {b}",
+                    ".byte 0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10",
+                    ".byte 0x66, 0x0f, 0x78, 0xc0, 0x08, 0x14",
+                    "movq {out}, xmm0",
+                    a = in(reg) 0x1111_2222_3333_4444u64, b = in(reg) 0xabcdu64,
+                    out = lateout(reg) out, out("xmm0") _, out("xmm1") _)
+            };
+            assert_eq!(out, 0xbc);
+            eprintln!("VEH test exercised INSERTQ and EXTRQ");
+        } else {
+            eprintln!("SKIP native SSE4a");
+        }
+        let has_monitorx = highest >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 29) != 0;
+        if !has_monitorx {
+            // SAFETY: the emulated wait hints write no memory.
+            let monitored = 0u64;
+            unsafe {
+                std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
+                    in("rax") &monitored, in("ecx") 0, in("edx") 0)
+            };
+        }
     }
 
     fn reg(low: u64, high: u64) -> M128A {

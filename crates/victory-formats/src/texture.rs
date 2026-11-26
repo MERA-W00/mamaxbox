@@ -176,7 +176,7 @@ pub struct Layout {
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block of each element coordinate bit, per
     /// axis; empty for linear and unsupported modes.
-    pattern: [Vec<u32>; 3],
+    pattern: std::borrow::Cow<'static, [Vec<u32>; 3]>,
 }
 
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
@@ -247,6 +247,26 @@ fn spread(bits: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// Extents, mip tails and row pitches change the base address. Only tile kind, element size
+/// and block size enter the three offset tables, so layouts can reuse each other's tables.
+fn layout_pattern(
+    kind: usize,
+    element_log2: u32,
+    block_log2: u32,
+    share: bool,
+) -> std::borrow::Cow<'static, [Vec<u32>; 3]> {
+    use std::{borrow::Cow, sync::OnceLock};
+    let make = || pattern(kind, element_log2, block_log2).map(|bits| spread(&bits));
+    if !share {
+        return Cow::Owned(make());
+    }
+    type Tables = [Vec<u32>; 3];
+    static CACHE: [[[OnceLock<Tables>; 5]; 3]; 3] =
+        [const { [const { [const { OnceLock::new() }; 5] }; 3] }; 3];
+    let block = ((block_log2 - 8) / 4) as usize;
+    Cow::Borrowed(CACHE[kind][block][element_log2 as usize].get_or_init(make))
+}
+
 const MAX_MIPS: u32 = 16;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
@@ -264,6 +284,16 @@ const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4],
 impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
         let d = *desc;
+        // A linear layout reserves storage for a single sample at each texel.
+        static CHECK_SAMPLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if d.samples > 1
+            && d.swizzle == Swizzle::LINEAR
+            && *CHECK_SAMPLES.get_or_init(|| {
+                std::env::var_os("VICTORY_LINEAR_MSAA_CHECK").is_some_and(|v| v == "1")
+            })
+        {
+            return Err(Error::Invalid);
+        }
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
             && (1..=MAX_EXTENT).contains(&d.height)
@@ -490,7 +520,11 @@ impl Layout {
             } else {
                 usize::from(d.swizzle.display())
             };
-            pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
+            static SHARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let share = *SHARE.get_or_init(|| {
+                std::env::var_os("VICTORY_SHARE_SWIZZLE_TABLES").is_some_and(|v| v == "1")
+            });
+            layout_pattern(kind, element_log2, block_log2, share)
         } else {
             Default::default()
         };
@@ -639,11 +673,23 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        // A volume slice needs room for the last row before the next slice begins.
+        static CHECK_PITCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if depth > 1
+            && depth_pitch < slice_bytes
+            && *CHECK_PITCH.get_or_init(|| {
+                std::env::var_os("VICTORY_VOLUME_SLICE_BOUNDS").is_some_and(|v| v == "1")
+            })
+        {
+            return Err(Error::TooSmall);
+        }
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
+            .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
         let (tiled_len, linear_len) = if DETILE {
             (src.len(), dst.len())
@@ -878,6 +924,74 @@ impl Texture {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linear_multisampling_checks_only_the_linear_layout() {
+        let strict = std::env::var_os("VICTORY_LINEAR_MSAA_CHECK").is_some_and(|v| v == "1");
+        let linear = desc(64, 64, 1, 4, Swizzle::LINEAR);
+        assert!(Layout::new(&linear).is_ok());
+        for samples in [2, 4, 8] {
+            let d = Desc { samples, ..linear };
+            assert_eq!(Layout::new(&d).is_err(), strict);
+            assert!(
+                Layout::new(&Desc {
+                    swizzle: Swizzle::SW_64KB_R_X,
+                    ..d
+                })
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_volume_slices_fit_at_the_exact_pitch() {
+        let strict = std::env::var_os("VICTORY_VOLUME_SLICE_BOUNDS").is_some_and(|v| v == "1");
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(4, 2, 1, 4, swizzle)
+            })
+            .unwrap();
+            let mut tiled = vec![0x42; layout.size as usize];
+            let mut linear = [0x55; 72];
+            for pitch in [0, 35, 36] {
+                let invalid = strict && pitch < 36;
+                assert_eq!(
+                    layout.detile(&tiled, 0, 0, &mut linear, 20, pitch).is_err(),
+                    invalid
+                );
+                assert_eq!(
+                    layout.tile(&mut tiled, 0, 0, &linear, 20, pitch).is_err(),
+                    invalid
+                );
+                if invalid {
+                    assert_eq!(linear, [0x55; 72]);
+                    assert!(tiled.iter().all(|&v| v == 0x42));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_swizzle_offsets_match_private_tables() {
+        for (kind, blocks) in [
+            (0, &[8, 12, 16][..]),
+            (1, &[8, 12, 16][..]),
+            (2, &[12, 16][..]),
+        ] {
+            for &block in blocks {
+                for element in 0..5 {
+                    let owned = super::layout_pattern(kind, element, block, false);
+                    let shared = super::layout_pattern(kind, element, block, true);
+                    let again = super::layout_pattern(kind, element, block, true);
+                    assert_eq!(owned, shared);
+                    assert!(matches!(owned, std::borrow::Cow::Owned(_)));
+                    assert!(std::ptr::eq(shared.as_ref(), again.as_ref()));
+                }
+            }
+        }
+    }
+
     use super::*;
 
     fn desc(w: u32, h: u32, mips: u32, bpe: u32, swizzle: Swizzle) -> Desc {

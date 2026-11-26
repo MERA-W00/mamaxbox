@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 victory-core.workspace = true
+kelvaroq-render = { path = "../kelvaroq-render" }
 blake3.workspace = true
 zlib-rs.workspace = true
 tracing.workspace = true

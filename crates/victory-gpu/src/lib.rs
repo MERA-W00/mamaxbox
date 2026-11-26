@@ -28,6 +28,7 @@ mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod shot;
 pub mod console;
+pub mod title_hold;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
@@ -41,6 +42,8 @@ mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod fast_cores;
 pub mod fence;
 pub mod frame;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -48,11 +51,16 @@ mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod frame_wait;
+#[cfg(windows)]
+mod monitor;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+mod launch;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -67,6 +75,8 @@ pub mod queue;
 #[cfg(windows)]
 mod queue2;
 pub mod resource;
+#[cfg(windows)]
+pub mod remap;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -89,9 +99,15 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{PoolCommit, title_memory_freeing, title_memory_section, title_memory_section_closed, title_memory_view, uma_pool};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    scoped_remap as texture_scoped_remap,
+    title_memory_committed,
+    title_memory_reading,
+    title_memory_remapped,
+    title_memory_remapping,
+    title_memory_remapping_in,
+    title_memory_written,
     writing as kernel_will_write,
 };

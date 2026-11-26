@@ -607,6 +607,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 #[cfg(test)]
 pub enum Root {
     Constants(Vec<u32>),
+    /// Bind a buffer from the dispatch's UAV readback list as a root UAV.
+    Uav(usize),
     /// A table starting at this heap index.
     Table {
         sampler: bool,
@@ -855,7 +857,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -986,6 +988,8 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// Raw buffer UAV initialized before dispatch, for resident BVH pages.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1224,7 +1228,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1234,6 +1238,10 @@ impl Host {
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
                             View::RawUav(n) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::RawUavData(data) => {
+                                let n = data.len() as u32;
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
                             _ => unreachable!(),
@@ -1255,6 +1263,16 @@ impl Host {
                                 },
                             },
                         };
+                        if let View::RawUavData(data) = v {
+                            let source = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &source, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(source);
+                        }
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1379,6 +1397,9 @@ impl Host {
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
+                    }
+                    Root::Uav(i) => {
+                        list.SetComputeRootUnorderedAccessView(*param, uavs[*i].0.GetGPUVirtualAddress());
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;

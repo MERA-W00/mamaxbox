@@ -88,7 +88,7 @@ mod tests {
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
         assert_eq!(
-            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("Sleep")),
+            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("SleepEx")),
             None
         );
     }
@@ -99,7 +99,7 @@ mod tests {
         let r = HleResolver::default();
         assert_eq!(
             r.classify("api-ms-win-core-synch-l1-2-0.dll", &name("Sleep")),
-            Some(Provenance::Host)
+            Some(if victory_gpu::title_hold::enabled() { Provenance::Hle } else { Provenance::Host })
         );
         // Console-only DLLs never pass through.
         assert_eq!(

@@ -8,11 +8,10 @@
 //! buffer's descriptor from the program's table (a resource of the host,
 //! [`crate::resource::BvhNodes::Resource`]), and the title's way, a
 //! descriptor of numbers over title memory with the structure's address in
-//! the node pointer or in the descriptor. These tests have no host that
-//! keeps copies of title memory and their directory, so for the second
-//! they put a stand-in under the node reader
-//! (`lower::intersect::TEST_MEMORY`); without it the same program reads
-//! through the directory, which is only checked to lower and validate.
+//! the node pointer or in the descriptor. The arithmetic comparisons use
+//! one buffer as a stand-in for title memory. The residency test binds the
+//! production directory and fault buffer and follows a box into a triangle
+//! with the two halves of the box backed by independent pages.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::intersect::TEST_MEMORY;
@@ -23,6 +22,8 @@ use crate::native::{
 };
 use crate::resource::BvhNodes;
 use crate::{ShaderError, io, ir, resource, structure};
+
+mod residency;
 
 /// Threads of one group, each with its own record.
 const THREADS: u32 = 32;
@@ -447,19 +448,23 @@ fn buffer(scene: &Scene, batch: &[Case], base: u64) -> Vec<u32> {
     let mut data = vec![0u32; (NODES / 4) as usize];
     for (t, case) in batch.iter().enumerate() {
         let Some((n, kind, ray)) = case else { continue };
-        let r = &mut data[t * (RECORD / 4) as usize..][..13];
         let pointer = (base >> 3) + u64::from(scene.pointer(*n, *kind));
-        (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
-        r[2] = ray.extent.to_bits();
-        for a in 0..3 {
-            r[3 + a] = ray.origin[a].to_bits();
-            r[6 + a] = ray.direction[a].to_bits();
-            r[9 + a] = ray.inverse[a].to_bits();
-        }
-        r[12] = 1;
+        ray_record(&mut data, t, pointer, ray);
     }
     data.extend(&scene.words);
     data
+}
+
+fn ray_record(data: &mut [u32], lane: usize, pointer: u64, ray: &Ray) {
+    let r = &mut data[lane * (RECORD / 4) as usize..][..13];
+    (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
+    r[2] = ray.extent.to_bits();
+    for a in 0..3 {
+        r[3 + a] = ray.origin[a].to_bits();
+        r[6 + a] = ray.direction[a].to_bits();
+        r[9 + a] = ray.inverse[a].to_bits();
+    }
+    r[12] = 1;
 }
 
 fn expected(scene: &Scene, case: &Case, sort: bool) -> [u32; 4] {

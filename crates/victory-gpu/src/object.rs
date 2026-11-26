@@ -133,7 +133,11 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
-            private_data().retain(|&(object, _), _| object != this as usize);
+            static SEEK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let seek = *SEEK.get_or_init(|| {
+                std::env::var_os("VICTORY_PRIVATE_DATA_SEEK").is_some_and(|v| v == "1")
+            });
+            clear_private_data(&mut private_data(), this as usize, seek);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
@@ -145,6 +149,17 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
 
 /// Private data of every object, by object address and id.
 static PRIVATE: Mutex<BTreeMap<(usize, Iid), Vec<u8>>> = Mutex::new(BTreeMap::new());
+
+/// On final release, entries for one object occupy a single range of the private-data map.
+/// Seeking to that range avoids visiting every other live object's entries under the lock.
+fn clear_private_data(data: &mut BTreeMap<(usize, Iid), Vec<u8>>, address: usize, seek: bool) {
+    if seek {
+        let keys = (address, [0; 16])..=(address, [u8::MAX; 16]);
+        data.extract_if(keys, |_, _| true).for_each(drop);
+    } else {
+        data.retain(|&(object, _), _| object != address);
+    }
+}
 
 fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u8>>> {
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -368,6 +383,23 @@ pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn final_release_clears_only_the_object_in_both_modes() {
+        for seek in [false, true] {
+            let mut data = std::collections::BTreeMap::new();
+            for address in [0, 17, usize::MAX] {
+                for key in [[0; 16], [4; 16], [u8::MAX; 16]] {
+                    data.insert((address, key), vec![5]);
+                }
+            }
+            for address in [17, 17, 1] {
+                super::clear_private_data(&mut data, address, seek);
+            }
+            assert_eq!(data.len(), 6);
+            assert!(data.keys().all(|&(address, _)| address != 17));
+        }
+    }
+
     use super::*;
 
     #[test]
