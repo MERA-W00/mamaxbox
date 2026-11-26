@@ -240,13 +240,20 @@ static RT_DYNAMIC: AtomicBool = AtomicBool::new(false); // Default: safe false (
 static RT_LIGHTS: AtomicBool = AtomicBool::new(false);
 static BVH_GUARD: AtomicBool = AtomicBool::new(true); // Default: hold unbuilt BVH dispatches
 
+// NVIDIA DLSS & NIS
+pub const DLSS_MODES: &[&str] = &["OFF", "QUALITY", "BALANCED", "PERF", "ULTRA PERF", "DLAA"];
+static DLSS_IDX: AtomicUsize = AtomicUsize::new(0); // Default: OFF
+
+pub const NIS_SHARPNESS: &[&str] = &["OFF", "15%", "30%", "50%", "75%", "100%"];
+static NIS_IDX: AtomicUsize = AtomicUsize::new(0); // Default: OFF
+
 // Graphics & Performance
 static WATER_SSR: AtomicBool = AtomicBool::new(false); // Default: safe false
 static ASYNC_COMPUTE: AtomicBool = AtomicBool::new(true);
 static MOTION_BLUR: AtomicBool = AtomicBool::new(false);
 static CONTROLS_EXPANDED: AtomicBool = AtomicBool::new(true);
 
-const TOTAL_ROWS: usize = 9;
+const TOTAL_ROWS: usize = 11;
 
 /// Whether the overlay is enabled at all.
 fn on() -> bool {
@@ -290,6 +297,8 @@ fn persist_settings_async() {
         let (w, h, _) = RESOLUTIONS[res_idx];
         let rt_dyn = RT_DYNAMIC.load(Ordering::Relaxed);
         let rt_light = RT_LIGHTS.load(Ordering::Relaxed);
+        let dlss_idx = DLSS_IDX.load(Ordering::Relaxed).min(DLSS_MODES.len() - 1);
+        let nis_idx = NIS_IDX.load(Ordering::Relaxed).min(NIS_SHARPNESS.len() - 1);
         let water_ssr = WATER_SSR.load(Ordering::Relaxed);
         let async_comp = ASYNC_COMPUTE.load(Ordering::Relaxed);
         let m_blur = MOTION_BLUR.load(Ordering::Relaxed);
@@ -310,6 +319,10 @@ fn persist_settings_async() {
                 *line = format!("    <rtDynamicShadows value=\"{}\" />", rt_dyn);
             } else if line.contains("<rtLODLightShadows value=") {
                 *line = format!("    <rtLODLightShadows value=\"{}\" />", rt_light);
+            } else if line.contains("<dlssQuality value=") {
+                *line = format!("    <dlssQuality value=\"{}\" />", dlss_idx);
+            } else if line.contains("<nisSharpen value=") {
+                *line = format!("    <nisSharpen value=\"{}\" />", NIS_SHARPNESS[nis_idx]);
             } else if line.contains("<waterReflectionSSR value=") {
                 *line = format!("    <waterReflectionSSR value=\"{}\" />", water_ssr);
             } else if line.contains("<asyncComputeEnabled value=") {
@@ -358,6 +371,28 @@ fn change_setting(row: usize, dir: i32) {
             BVH_GUARD.store(!cur, Ordering::Relaxed);
         }
         4 => {
+            // NVIDIA DLSS Mode
+            let cur = DLSS_IDX.load(Ordering::Relaxed);
+            let next = if dir < 0 {
+                if cur == 0 { DLSS_MODES.len() - 1 } else { cur - 1 }
+            } else {
+                (cur + 1) % DLSS_MODES.len()
+            };
+            DLSS_IDX.store(next, Ordering::Relaxed);
+            persist_settings_async();
+        }
+        5 => {
+            // NVIDIA NIS Sharpening
+            let cur = NIS_IDX.load(Ordering::Relaxed);
+            let next = if dir < 0 {
+                if cur == 0 { NIS_SHARPNESS.len() - 1 } else { cur - 1 }
+            } else {
+                (cur + 1) % NIS_SHARPNESS.len()
+            };
+            NIS_IDX.store(next, Ordering::Relaxed);
+            persist_settings_async();
+        }
+        6 => {
             // FPS Limit
             if dir < 0 {
                 let prev = match crate::frame::current_limit() {
@@ -371,25 +406,25 @@ fn change_setting(row: usize, dir: i32) {
                 crate::frame::cycle_limit();
             }
         }
-        5 => {
+        7 => {
             // Water SSR
             let cur = WATER_SSR.load(Ordering::Relaxed);
             WATER_SSR.store(!cur, Ordering::Relaxed);
             persist_settings_async();
         }
-        6 => {
+        8 => {
             // Async Compute
             let cur = ASYNC_COMPUTE.load(Ordering::Relaxed);
             ASYNC_COMPUTE.store(!cur, Ordering::Relaxed);
             persist_settings_async();
         }
-        7 => {
+        9 => {
             // Motion Blur
             let cur = MOTION_BLUR.load(Ordering::Relaxed);
             MOTION_BLUR.store(!cur, Ordering::Relaxed);
             persist_settings_async();
         }
-        8 => {
+        10 => {
             // Controls Cheatsheet
             let cur = CONTROLS_EXPANDED.load(Ordering::Relaxed);
             CONTROLS_EXPANDED.store(!cur, Ordering::Relaxed);
@@ -672,15 +707,39 @@ fn get_overlay_lines(
     };
     lines.push(format!("{} BVH GUARD  : {}", marker(3), bvh_str));
 
-    // 3. Graphics & Pace
-    lines.push("-- [3] GRAPHICS & FRAME PACING ------------------------------------".to_string());
+    // 3. NVIDIA RTX Upscaling & Enhancements
+    lines.push("-- [3] NVIDIA RTX UPSCALING & ENHANCEMENTS -------------------------".to_string());
+    let dlss_idx = DLSS_IDX.load(Ordering::Relaxed);
+    let mut dlss_line = format!("{} NVIDIA DLSS : ", marker(4));
+    for (i, &name) in DLSS_MODES.iter().enumerate() {
+        if i == dlss_idx {
+            dlss_line.push_str(&format!(" *[{}]*", name));
+        } else {
+            dlss_line.push_str(&format!("  {} ", name));
+        }
+    }
+    lines.push(dlss_line);
+
+    let nis_idx = NIS_IDX.load(Ordering::Relaxed);
+    let mut nis_line = format!("{} NVIDIA NIS  : ", marker(5));
+    for (i, &val) in NIS_SHARPNESS.iter().enumerate() {
+        if i == nis_idx {
+            nis_line.push_str(&format!(" *[{}]*", val));
+        } else {
+            nis_line.push_str(&format!("  {} ", val));
+        }
+    }
+    lines.push(nis_line);
+
+    // 4. Graphics & Pace
+    lines.push("-- [4] GRAPHICS & FRAME PACING ------------------------------------".to_string());
     let limit_str = match limit {
         30 => " *[30]*   60    120   UNLIMITED",
         60 => "  30   *[60]*   120   UNLIMITED",
         120 => "  30    60   *[120]*  UNLIMITED",
         _ => "  30    60    120  *[UNLIMITED]*",
     };
-    lines.push(format!("{} FPS LIMIT  : {}  <F1>", marker(4), limit_str));
+    lines.push(format!("{} FPS LIMIT  : {}  <F1>", marker(6), limit_str));
 
     let w_ssr = WATER_SSR.load(Ordering::Relaxed);
     let ssr_str = if w_ssr {
@@ -688,21 +747,21 @@ fn get_overlay_lines(
     } else {
         " *[OFF (STABLE)]*        ON                  "
     };
-    lines.push(format!("{} WATER SSR  : {}", marker(5), ssr_str));
+    lines.push(format!("{} WATER SSR  : {}", marker(7), ssr_str));
 
     let async_c = ASYNC_COMPUTE.load(Ordering::Relaxed);
     let async_str = if async_c { " *[ENABLED]*    DISABLED" } else { "   ENABLED   *[DISABLED]*" };
-    lines.push(format!("{} ASYNC COMP : {}", marker(6), async_str));
+    lines.push(format!("{} ASYNC COMP : {}", marker(8), async_str));
 
     let mb = MOTION_BLUR.load(Ordering::Relaxed);
     let mb_str = if mb { "   OFF       *[ON]*" } else { " *[OFF]*       ON  " };
-    lines.push(format!("{} MOTION BLUR: {}", marker(7), mb_str));
+    lines.push(format!("{} MOTION BLUR: {}", marker(9), mb_str));
 
-    // 4. Cheatsheet
-    lines.push("-- [4] INPUT & CONTROLLER CHEATSHEET ------------------------------".to_string());
+    // 5. Cheatsheet
+    lines.push("-- [5] INPUT & CONTROLLER CHEATSHEET ------------------------------".to_string());
     let expanded = CONTROLS_EXPANDED.load(Ordering::Relaxed);
     let expand_tag = if expanded { "[- HIDE]" } else { "[+ EXPAND]" };
-    lines.push(format!("{} DUALSENSE / XBOX / KEYBOARD CHEATSHEET  {}", marker(8), expand_tag));
+    lines.push(format!("{} DUALSENSE / XBOX / KEYBOARD CHEATSHEET  {}", marker(10), expand_tag));
     if expanded {
         lines.push("  SELECT: [X / A / ENTER]        BACK: [O / B / BKSP]".to_string());
         lines.push("  ACTION: [SQR / X / X]          MENU: [TRI / Y / Y]".to_string());
@@ -880,6 +939,8 @@ pub(crate) fn draw(
 
         let res_idx = RES_IDX.load(Ordering::Relaxed);
         let rt_dyn = RT_DYNAMIC.load(Ordering::Relaxed);
+        let dlss_idx = DLSS_IDX.load(Ordering::Relaxed);
+        let nis_idx = NIS_IDX.load(Ordering::Relaxed);
         let (cur_w, cur_h) = crate::dxgi::current_display_size();
 
         let key = {
@@ -888,6 +949,8 @@ pub(crate) fn draw(
             h ^= (limit as u64) << 48;
             h ^= (focused_row as u64) << 56;
             h ^= (res_idx as u64) << 8;
+            h ^= (dlss_idx as u64) << 24;
+            h ^= (nis_idx as u64) << 20;
             h ^= ((cur_w as u64) << 36) ^ ((cur_h as u64) << 12);
             h ^= if rt_dyn { 1 << 62 } else { 0 };
             h ^= if menu_open { 1 << 63 } else { 0 };
@@ -972,7 +1035,7 @@ pub(crate) fn draw(
 /// Cache of made graph overlay buffers (top-right corner).
 static GRAPH_MADE: Mutex<Option<HashMap<u64, Made>>> = Mutex::new(None);
 
-/// Render CPU & GPU usage bitmap with graphical sparklines.
+/// Render CPU & GPU numerical usage telemetry in the top-right corner.
 fn render_graphs_bitmap(cpu_hist: &[u8], gpu_hist: &[u8], scale: u32) -> (u32, u32, Vec<bool>, Vec<bool>) {
     let cpu_cur = *cpu_hist.last().unwrap_or(&30);
     let gpu_cur = *gpu_hist.last().unwrap_or(&35);
@@ -988,63 +1051,45 @@ fn render_graphs_bitmap(cpu_hist: &[u8], gpu_hist: &[u8], scale: u32) -> (u32, u
     let gpu_label = if clean_gpu.len() > 32 { &clean_gpu[..32] } else { &clean_gpu };
 
     let lines = vec![
-        "--- [F4] HARDWARE MONITORS -----------------------------".to_string(),
-        format!(" CPU LOAD: {:>3}%  [{:<32}]", cpu_cur, cpu_label),
-        "                                                        ".to_string(), // Row 2: CPU Graph Plot Area
-        format!(" GPU LOAD: {:>3}%  [{:<32}]", gpu_cur, gpu_label),
-        "                                                        ".to_string(), // Row 4: GPU Graph Plot Area
+        "--- [F4] HARDWARE TELEMETRY ----------------------------".to_string(),
+        format!(" CPU LOAD : {:>3}%  [{:<32}]", cpu_cur, cpu_label),
+        format!(" GPU LOAD : {:>3}%  [{:<32}]", gpu_cur, gpu_label),
         "========================================================".to_string(),
-        " [F4: HIDE/SHOW GRAPHS]                                 ".to_string(),
     ];
 
-    let (w, h, mut lit, mut hl) = bitmap(&lines, scale);
+    let (w, h, lit, mut hl) = bitmap(&lines, scale);
 
-    let pad_x = 3 * scale;
-    let pad_y = 3 * scale;
-    let line_height = 7 * scale;
-    let line_spacing = 2 * scale;
-
-    let mut plot = |row_idx: u32, hist: &[u8]| {
-        let line_top = pad_y + row_idx * (line_height + line_spacing);
-        let line_bot = line_top + line_height;
-        let start_x = pad_x + 2 * 6 * scale;
-
-        let count = hist.len().min(40);
-        let slice = &hist[hist.len().saturating_sub(count)..];
-
-        for (i, &val) in slice.iter().enumerate() {
-            let col_x = start_x + (i as u32) * 6 * scale;
-            let bar_h = (val as u32 * line_height) / 100;
-            let bar_top = line_bot.saturating_sub(bar_h.max(1));
-
-            for cy in bar_top..line_bot {
-                if cy >= h { break; }
-                for cx in col_x..col_x + 5 * scale {
-                    if cx >= w { break; }
+    // Highlight load numbers if high (>= 80%)
+    if cpu_cur >= 80 || gpu_cur >= 80 {
+        let line_height = 7 * scale;
+        let line_spacing = 2 * scale;
+        let pad_y = 3 * scale;
+        if cpu_cur >= 80 {
+            let top = pad_y + (line_height + line_spacing);
+            let bot = top + line_height;
+            for cy in top..bot.min(h) {
+                for cx in 0..w {
                     let idx = (cy * w + cx) as usize;
-                    lit[idx] = true;
-                    if val >= 80 {
-                        hl[idx] = true;
-                    }
+                    if lit[idx] { hl[idx] = true; }
                 }
             }
-
-            // Reference dot at 50% line
-            let mid_y = line_bot.saturating_sub(line_height / 2);
-            if mid_y < h && i % 4 == 0 {
-                let idx = (mid_y * w + col_x) as usize;
-                lit[idx] = true;
+        }
+        if gpu_cur >= 80 {
+            let top = pad_y + 2 * (line_height + line_spacing);
+            let bot = top + line_height;
+            for cy in top..bot.min(h) {
+                for cx in 0..w {
+                    let idx = (cy * w + cx) as usize;
+                    if lit[idx] { hl[idx] = true; }
+                }
             }
         }
-    };
-
-    plot(2, cpu_hist);
-    plot(4, gpu_hist);
+    }
 
     (w, h, lit, hl)
 }
 
-/// Renders the 2 hardware performance graphs in the top-right corner of the backbuffer.
+/// Renders the 2 hardware performance monitors in the top-right corner of the backbuffer.
 fn draw_graphs(
     host: &crate::host::Host,
     list: &ID3D12GraphicsCommandList,
@@ -1066,8 +1111,7 @@ fn draw_graphs(
     let key = (cpu_cur as u64)
         | ((gpu_cur as u64) << 8)
         | ((format.0 as u64) << 16)
-        | ((scale as u64) << 32)
-        | (((cpu_hist.len() ^ gpu_hist.len()) as u64) << 48);
+        | ((scale as u64) << 32);
 
     let mut graph_cache = GRAPH_MADE.lock().unwrap_or_else(|e| e.into_inner());
     let graph_cache = graph_cache.get_or_insert_with(HashMap::new);
@@ -1285,8 +1329,17 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("2560p")));
         assert!(lines.iter().any(|l| l.contains("4K")));
         assert!(lines.iter().any(|l| l.contains("DYNAMIC RT")));
+        assert!(lines.iter().any(|l| l.contains("NVIDIA DLSS")));
+        assert!(lines.iter().any(|l| l.contains("NVIDIA NIS")));
         assert!(lines.iter().any(|l| l.contains("GRAPHICS & FRAME PACING")));
         assert!(!lines.iter().any(|l| l.contains("FSR")));
+    }
+
+    #[test]
+    fn hardware_monitors_numerical_only() {
+        let (w, h, lit, _hl) = render_graphs_bitmap(&[42], &[68], 2);
+        assert!(w > 0 && h > 0);
+        assert_eq!(lit.len(), (w * h) as usize);
     }
 
     #[test]
