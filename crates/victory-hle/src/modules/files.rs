@@ -253,6 +253,12 @@ type File = *mut c_void;
 
 // kernel32 and its file API sets.
 
+static RUNTIME_SKIP_BOOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_skip_boot(val: bool) {
+    RUNTIME_SKIP_BOOT.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn is_intro_video(path: *const u16) -> bool {
     if path.is_null() {
         return false;
@@ -261,7 +267,8 @@ fn is_intro_video(path: *const u16) -> bool {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len)).to_ascii_lowercase()
     };
-    let skip_boot = std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
+    let skip_boot = RUNTIME_SKIP_BOOT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
     if !skip_boot {
         return false;
     }
@@ -274,7 +281,8 @@ fn narrow_is_intro_video(path: *const c_char) -> bool {
         return false;
     }
     let s = unsafe { CStr::from_ptr(path) }.to_string_lossy().to_ascii_lowercase();
-    let skip_boot = std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
+    let skip_boot = RUNTIME_SKIP_BOOT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
     if !skip_boot {
         return false;
     }

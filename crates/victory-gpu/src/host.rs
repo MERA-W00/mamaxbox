@@ -7836,6 +7836,8 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        let gpu_busy_pct = ((gpu / ms.max(0.1)) * 100.0).clamp(5.0, 99.0).round() as u8;
+        crate::fpsbox::record_gpu_sample(gpu_busy_pct);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
