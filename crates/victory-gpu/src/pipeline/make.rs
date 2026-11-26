@@ -73,12 +73,18 @@ impl Pending {
         // crashed under stays inside the call for good (see [`guard_start`]),
         // and anyone else asking would wait for it forever.
         if self.made.get().is_none() {
-            let made = if is_bad_key(&self.key) {
+            let should_skip = is_bad_key(&self.key) || super::is_skipped_shaders(&self.shaders);
+            let made = if should_skip {
                 SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: pipeline is skipped or crashed before");
                 None
             } else {
-                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                guard_start();
+                let slot = current_or_caller_slot();
+                let _compile = Compile::begin(slot, self);
+                let res = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                drop(_compile);
+                res
             };
             let _ = self.made.set(made);
         }
@@ -134,11 +140,28 @@ static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SL
 static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
 static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_JOBS: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
+
+struct ActiveJob {
+    key: String,
+    shaders: Vec<Arc<Shader>>,
+}
+
+static ACTIVE_JOBS: Mutex<Vec<Option<ActiveJob>>> = Mutex::new(Vec::new());
 
 thread_local! {
     static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
     static COMPILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn current_or_caller_slot() -> usize {
+    let mut slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
+    if slot >= MAX_SLOTS {
+        slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        if slot < MAX_SLOTS {
+            let _ = WORKER_SLOT.try_with(|s| s.set(slot));
+        }
+    }
+    slot
 }
 
 struct Compile {
@@ -146,13 +169,16 @@ struct Compile {
 }
 
 impl Compile {
-    fn begin(slot: usize, p: &Arc<Pending>) -> Compile {
+    fn begin(slot: usize, p: &Pending) -> Compile {
         if slot < MAX_SLOTS && guard_on() {
             let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if jobs.len() < MAX_SLOTS {
-                jobs.resize(MAX_SLOTS, None);
+                jobs.resize_with(MAX_SLOTS, || None);
             }
-            jobs[slot] = Some(p.clone());
+            jobs[slot] = Some(ActiveJob {
+                key: p.key.clone(),
+                shaders: p.shaders.clone(),
+            });
             COMPILING.set(true);
         }
         Compile { slot }
@@ -214,11 +240,9 @@ unsafe extern "system" fn compiler_crashed(
     const CONTINUE_SEARCH: i32 = 0;
     // SAFETY: the OS passes a live exception record.
     let record = unsafe { &*(*info).ExceptionRecord };
-    let is_low_av = record.ExceptionCode == ACCESS_VIOLATION
-        && record.NumberParameters >= 2
-        && record.ExceptionInformation[1] < 0x10000;
+    let is_av = record.ExceptionCode == ACCESS_VIOLATION;
     let is_sigill = record.ExceptionCode == ILLEGAL_INSTRUCTION;
-    if !is_low_av && !is_sigill {
+    if !is_av && !is_sigill {
         return CONTINUE_SEARCH;
     }
     if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
@@ -266,26 +290,25 @@ fn lost(slot: usize) {
         let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
         jobs.get_mut(slot).and_then(Option::take)
     };
-    let Some(p) = job else {
+    let Some(job) = job else {
         return;
     };
     tracing::error!(
-        key = p.key,
-        shaders = ?p.shaders,
+        key = job.key,
+        shaders = ?job.shaders,
         code = format_args!("{:#x}", FAULT_CODE[slot].load(Ordering::Relaxed)),
         rip = format_args!("{:#x}", FAULT_RIP[slot].load(Ordering::Relaxed)),
         address = format_args!("{:#x}", FAULT_ADDR[slot].load(Ordering::Relaxed)),
         "driver shader compiler crashed making a pipeline: skipping it and spawning replacement worker"
     );
-    let known = bad_keys(|keys| !keys.insert(p.key.clone()));
+    let known = bad_keys(|keys| !keys.insert(job.key.clone()));
     if !known && let Some(dir) = super::library::folder() {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", job.key, job.shaders);
         }
     }
-    let _ = p.made.set(None);
     {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -609,9 +632,7 @@ fn spawn_worker() -> bool {
             }
             loop {
                 let p = next();
-                let _compile = Compile::begin(slot, &p);
                 p.make();
-                drop(_compile);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {

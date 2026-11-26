@@ -516,8 +516,8 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+#[cfg(windows)]
+pub(crate) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -534,6 +534,19 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[cfg(windows)]
+pub(crate) fn is_skipped_shaders(shaders: &[Arc<Shader>]) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        parse_skip_hashes(&value)
+    });
+    if hashes.is_empty() {
+        return false;
+    }
+    shaders.iter().any(|shader| hashes.contains(&shader.hash))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
