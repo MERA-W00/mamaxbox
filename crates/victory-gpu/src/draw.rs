@@ -2879,6 +2879,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+            tracing::info!(pipeline = self.pipeline, x, launch_mode = crate::launch::on(), "mesh dispatch skipped");
         }
     }
 
@@ -3443,6 +3444,9 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            if kind == MESH {
+                tracing::info!(pipeline = self.pipeline, kind, max, launch_mode = crate::launch::on(), "indirect mesh dispatch dropped: no host pipeline");
+            }
             return false;
         };
         // Indirect rectangles (the title's tiled lighting, 256
