@@ -477,11 +477,6 @@ fn library() -> Option<&'static Library> {
             // With RenderDoc loaded the device is RenderDoc's: the card's
             // library is not for it, and what it would save is not for
             // the card. Neither read nor written in such a run.
-            #[cfg(feature = "diagnostics")]
-            if crate::renderdoc::loaded() {
-                tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
-                return None;
-            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             if precompile::tracking() && !precompile::writer(DIR.get()?) {
                 return None;

@@ -1079,7 +1079,7 @@ pub(crate) fn module() -> HleModule {
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 

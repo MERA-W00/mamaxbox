@@ -637,8 +637,6 @@ fn create() -> windows::core::Result<Host> {
 
                     let feature_levels = [
                         D3D_FEATURE_LEVEL_12_0,
-                        D3D_FEATURE_LEVEL_11_1,
-                        D3D_FEATURE_LEVEL_11_0,
                     ];
                     for fl in feature_levels {
                         let mut dev: Option<ID3D12Device> = None;

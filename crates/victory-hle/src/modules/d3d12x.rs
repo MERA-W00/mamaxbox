@@ -24,18 +24,16 @@ extern "system" fn create_device(
     device::create(adapter, parameters, iid, out)
 }
 
-/// A host GPU failure triggers the fail-safe black screen and overload banner
-/// instead of immediately terminating the process, allowing the user to recover or see the cause.
+/// A host GPU failure ends the run like a crash: reported to the crash log,
+/// then the process ends as the console ends a title.
 #[cfg(windows)]
 fn host_gpu_failed(what: &str) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
-    tracing::error!("Host GPU failure caught by overload fail-safe: {what}");
-    victory_gpu::fpsbox::trigger_gpu_overload(what);
-    // Keep thread alive in sleep loop so presentation / UI layer displays the black
-    // screen and overload warning dialog instead of abruptly killing the process.
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
+    // SAFETY: ends our own process.
+    unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
+    unreachable!("the process has ended")
 }
 
 /// The offline warm-up: see `victory_gpu::shader_cache::warm`.

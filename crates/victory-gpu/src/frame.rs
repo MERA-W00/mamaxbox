@@ -238,9 +238,6 @@ pub(crate) extern "system" fn wait(
         if let Some(start) = timing {
             kelvaroq_render::pacing::wait(wait.min(limit), start.elapsed());
         }
-        let us = wait.min(limit).as_micros() as u64;
-        crate::framelog::add(crate::framelog::T::PaceUs, us);
-        crate::framelog::here(crate::framelog::H::PaceUs, us);
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
