@@ -1080,7 +1080,7 @@ pub(crate) fn module() -> HleModule {
 #[cfg(windows)]
 mod host {
     use std::sync::atomic::Ordering;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -1263,15 +1263,6 @@ mod host {
                     }
                 }
 
-                // Automatic A pulse when VICTORY_AUTO_A is set (starts at 5s, pulses 200ms every 1.5s)
-                static AUTO_A: OnceLock<bool> = OnceLock::new();
-                if *AUTO_A.get_or_init(|| std::env::var_os("VICTORY_AUTO_A").is_some_and(|v| v != "0")) {
-                    static START: OnceLock<Instant> = OnceLock::new();
-                    let elapsed = START.get_or_init(Instant::now).elapsed();
-                    if elapsed > Duration::from_secs(5) && (elapsed.as_millis() % 1500) < 200 {
-                        extra_buttons |= A;
-                    }
-                }
 
                 if extra_buttons != 0 || extra_axes {
                     let p = pad.get_or_insert_with(PadState::default);

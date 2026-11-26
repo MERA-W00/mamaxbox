@@ -3,7 +3,6 @@
 Recursive Debugging Workflow for MamaXbox / Grand Theft Auto VI (Scarlett)
 - Ensures zero dangling processes before launching.
 - Monitors startup, detects when screen opens and presents frames.
-- Automatically clicks A / X (via wtype Enter/Space, direct UDP pad packets, and VICTORY_AUTO_A).
 - Waits until the menu loads.
 - If the screen closes or the process exits unexpectedly, immediately kills associated tasks
   and extracts full diagnostic crash context.
@@ -125,7 +124,6 @@ def run_debug_cycle(max_wait_seconds=360):
         LOG_PATH.write_text("")
 
     env = os.environ.copy()
-    env["VICTORY_AUTO_A"] = "1"
     env["VICTORY_FPS_LIMIT"] = "60"
     env["VICTORY_STACKS"] = "20,35"
     env["VICTORY_WALLS_TRACE"] = "1"
@@ -186,7 +184,7 @@ def run_debug_cycle(max_wait_seconds=360):
                 # Check for screen opened / first presented frame
                 if not screen_opened and ("frame presented" in text or "frame=64" in text):
                     screen_opened = True
-                    print(f"[Supervisor] Screen opened and presenting frames! Beginning A/X input clicks...", file=sys.stderr)
+                    print(f"[Supervisor] Screen opened and presenting frames!", file=sys.stderr)
 
                 # Check for driver crashes or compiler errors in new text
                 for line in new_text.splitlines():
@@ -238,17 +236,6 @@ def run_debug_cycle(max_wait_seconds=360):
                         print(f"[Screen OCR t+{now - start_time:.0f}s] {sample}", file=sys.stderr)
                 except Exception:
                     pass
-
-            # If screen is open, pulse A / X periodically
-            if screen_opened and (now - last_click_time >= 1.5):
-                last_click_time = now
-                if int(now - start_time) % 15 == 0:
-                    print(f"[Supervisor] Sending A/X input (wtype Return + UDP 0x4) at t+{now - start_time:.1f}s", file=sys.stderr)
-                focus_game_window()
-                send_pad_click(BUTTON_A)
-                send_pad_click(BUTTON_X)
-                send_wtype_key("Return")
-                send_wtype_key("space")
 
             time.sleep(0.5)
 
