@@ -25,6 +25,8 @@ static DRAWS: AtomicU32 = AtomicU32::new(21);
 
 /// Whether the dropdown menu is dropped down / open.
 static MENU_OPEN: AtomicBool = AtomicBool::new(true);
+/// Whether the entire overlay / dropdown menu is hidden (toggled via F3).
+static HUD_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// Currently focused row index in the dropdown menu.
 static CURRENT_ROW: AtomicUsize = AtomicUsize::new(0);
 
@@ -242,12 +244,13 @@ fn check_keys() {
     #[cfg(windows)]
     {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+            GetAsyncKeyState, VK_DOWN, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_LEFT, VK_RETURN, VK_RIGHT,
             VK_SPACE, VK_UP,
         };
 
         static F1_HELD: AtomicBool = AtomicBool::new(false);
         static F2_HELD: AtomicBool = AtomicBool::new(false);
+        static F3_HELD: AtomicBool = AtomicBool::new(false);
         static UP_HELD: AtomicBool = AtomicBool::new(false);
         static DOWN_HELD: AtomicBool = AtomicBool::new(false);
         static LEFT_HELD: AtomicBool = AtomicBool::new(false);
@@ -271,6 +274,15 @@ fn check_keys() {
             MENU_OPEN.store(!prev, Ordering::Relaxed);
         } else if !f2 {
             F2_HELD.store(false, Ordering::Relaxed);
+        }
+
+        // F3: Toggle entire HUD / dropdown menu visibility (hide/show)
+        let f3 = is_down(VK_F3.0);
+        if f3 && !F3_HELD.swap(true, Ordering::Relaxed) {
+            let prev = HUD_HIDDEN.load(Ordering::Relaxed);
+            HUD_HIDDEN.store(!prev, Ordering::Relaxed);
+        } else if !f3 {
+            F3_HELD.store(false, Ordering::Relaxed);
         }
 
         let esc = is_down(VK_ESCAPE.0);
@@ -424,7 +436,7 @@ fn get_overlay_lines(
     // If dropdown menu is closed, show a concise HUD bar
     if !menu_open {
         return vec![
-            format!("SCARLETT HUD | {:>4.1} FPS ({:>4.1} MS) | {:>4}x{:<4} | [F2: MENU]", fps_f, ms, cur_w, cur_h),
+            format!("SCARLETT HUD | {:>4.1} FPS ({:>4.1} MS) | {:>4}x{:<4} | [F2: MENU] [F3: HIDE]", fps_f, ms, cur_w, cur_h),
         ];
     }
 
@@ -537,7 +549,7 @@ fn get_overlay_lines(
     }
 
     lines.push("===================================================================".to_string());
-    lines.push("NAV: [UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [F2] MENU  [F1] FPS CEILING".to_string());
+    lines.push("NAV: [UP/DOWN] SELECT  [LEFT/RIGHT] CHANGE  [F2] MENU  [F3] HIDE  [F1] FPS".to_string());
     lines
 }
 
@@ -550,13 +562,13 @@ fn pixel_bytes(format: DXGI_FORMAT) -> Option<usize> {
     }
 }
 
-/// Write a single pixel: bright cyan text, accent gold for highlights, or dark high-contrast backdrop.
+/// Write a single pixel: crisp bright white text, accent gold for highlights, or dark high-contrast backdrop.
 fn pixel(format: DXGI_FORMAT, lit: bool, is_highlight: bool, out: &mut [u8]) {
     let (r, g, b): (f32, f32, f32) = if lit {
         if is_highlight {
             (0.98, 0.85, 0.15) // Warm golden highlight for active selections
         } else {
-            (0.15, 0.92, 0.95) // Bright crisp cyan text
+            (0.95, 0.95, 0.95) // Crisp bright white text
         }
     } else {
         (0.04, 0.05, 0.08) // Dark charcoal translucent background
@@ -666,6 +678,9 @@ pub(crate) fn draw(
         return;
     }
     check_keys();
+    if HUD_HIDDEN.load(Ordering::Relaxed) {
+        return;
+    }
 
     let tenths = TENTHS.load(Ordering::Relaxed);
     let ms_tenths = MS_TENTHS.load(Ordering::Relaxed);
@@ -741,16 +756,19 @@ pub(crate) fn draw(
         return;
     }
 
-    // Top-right alignment calculation by default, with environmental placement override
-    let hud_pos = std::env::var("VICTORY_HUD_POS").unwrap_or_else(|_| "top-right".to_string());
+    // Top-left alignment calculation by default, with environmental placement override
+    let hud_pos = std::env::var("VICTORY_HUD_POS").unwrap_or_else(|_| "top-left".to_string());
     let (x_pos, y_pos) = match hud_pos.as_str() {
-        "top-left" => (margin_x, margin_y),
+        "top-right" => (
+            width.saturating_sub(m.width + margin_x),
+            margin_y,
+        ),
         "bottom-left" => (margin_x, height.saturating_sub(m.height + margin_y)),
         "bottom-right" => (
             width.saturating_sub(m.width + margin_x),
             height.saturating_sub(m.height + margin_y),
         ),
-        _ => (width.saturating_sub(m.width + margin_x), margin_y), // Top-right (default)
+        _ => (margin_x, margin_y), // Top-left (default)
     };
 
     // SAFETY: D3D12 texture copy from mapped buffer to backbuffer.
@@ -805,6 +823,7 @@ mod tests {
         assert!(lines[0].contains("SCARLETT HUD"));
         assert!(lines[0].contains("1920x1200"));
         assert!(lines[0].contains("[F2: MENU]"));
+        assert!(lines[0].contains("[F3: HIDE]"));
     }
 
     #[test]
@@ -817,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn top_right_position_within_bounds() {
+    fn top_left_position_within_bounds() {
         let screen_w = 1920u32;
         let screen_h = 1200u32;
         let overlay_w = 408u32;
@@ -825,12 +844,12 @@ mod tests {
         let margin_x = 16u32;
         let margin_y = 12u32;
 
-        let x_pos = screen_w.saturating_sub(overlay_w + margin_x);
+        let x_pos = margin_x;
         let y_pos = margin_y;
 
         assert!(x_pos + overlay_w <= screen_w);
         assert!(y_pos + overlay_h <= screen_h);
-        assert_eq!(x_pos, 1496);
+        assert_eq!(x_pos, 16);
         assert_eq!(y_pos, 12);
     }
 }
