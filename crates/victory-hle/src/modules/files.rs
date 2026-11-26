@@ -253,6 +253,35 @@ type File = *mut c_void;
 
 // kernel32 and its file API sets.
 
+fn is_intro_video(path: *const u16) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let s = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(path, len)).to_ascii_lowercase()
+    };
+    let skip_boot = std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
+    if !skip_boot {
+        return false;
+    }
+    (s.contains("intro") || s.contains("legal") || s.contains("startup") || s.contains("splash"))
+        && (s.ends_with(".bk2") || s.ends_with(".bik") || s.ends_with(".mp4") || s.ends_with(".png"))
+}
+
+fn narrow_is_intro_video(path: *const c_char) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let s = unsafe { CStr::from_ptr(path) }.to_string_lossy().to_ascii_lowercase();
+    let skip_boot = std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
+    if !skip_boot {
+        return false;
+    }
+    (s.contains("intro") || s.contains("legal") || s.contains("startup") || s.contains("splash"))
+        && (s.ends_with(".bk2") || s.ends_with(".bik") || s.ends_with(".mp4") || s.ends_with(".png"))
+}
+
 pub extern "system" fn CreateFileW(
     path: *const u16,
     access: u32,
@@ -262,6 +291,12 @@ pub extern "system" fn CreateFileW(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    if is_intro_video(path) {
+        tracing::info!("bypassing intro video file to skip boot screen");
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Foundation::SetLastError(2); }
+        return !0 as Handle;
+    }
     let p = wide(path);
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
@@ -283,6 +318,12 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
+    if narrow_is_intro_video(path) {
+        tracing::info!("bypassing intro video file to skip boot screen");
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Foundation::SetLastError(2); }
+        return !0 as Handle;
+    }
     match narrow(path) {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
@@ -317,6 +358,12 @@ pub extern "system" fn CreateFile2(
     disposition: u32,
     params: *const c_void,
 ) -> Handle {
+    if is_intro_video(path) {
+        tracing::info!("bypassing intro video file to skip boot screen");
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Foundation::SetLastError(2); }
+        return !0 as Handle;
+    }
     let p = wide(path);
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),

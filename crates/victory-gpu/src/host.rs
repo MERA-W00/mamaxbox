@@ -568,12 +568,15 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    crate::fpsbox::trigger_gpu_overload(&text);
     // Tests have no log: the reason goes to their output.
     #[cfg(test)]
     eprintln!("host GPU failure: {text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
-        None => std::process::abort(),
+        None => loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        },
     }
 }
 
@@ -8184,9 +8187,10 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
+            if !crate::fpsbox::is_gpu_overloaded() {
+                list.CopyResource(&back, texture);
+            }
+            // The frame rate or full-screen black overload dialog, into the back buffer
             crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -8216,7 +8220,12 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let pres = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if pres.is_err() || crate::fpsbox::is_gpu_overloaded() {
+                if let Some(reason) = crate::fpsbox::overload_reason() {
+                    crate::fpsbox::paint_gdi_overload(p.hwnd, &reason);
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

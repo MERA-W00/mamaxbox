@@ -7,7 +7,8 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, c_char, c_void};
+use std::sync::OnceLock;
 
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
@@ -348,6 +349,43 @@ fn refuse(file: &str) {
     }
 }
 
+static COMMAND_LINE_W: OnceLock<Vec<u16>> = OnceLock::new();
+static COMMAND_LINE_A: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Sets the command line string that the title sees via `GetCommandLineW` and `GetCommandLineA`.
+pub fn set_command_line(cmd: &str) {
+    let wide: Vec<u16> = cmd.encode_utf16().chain(Some(0)).collect();
+    let ansi: Vec<u8> = cmd.bytes().chain(Some(0)).collect();
+    let _ = COMMAND_LINE_W.set(wide);
+    let _ = COMMAND_LINE_A.set(ansi);
+}
+
+pub extern "system" fn GetCommandLineW() -> *const u16 {
+    if let Some(w) = COMMAND_LINE_W.get() {
+        w.as_ptr()
+    } else {
+        #[cfg(windows)]
+        {
+            crate::modules::files::host!("kernel32.dll", "GetCommandLineW": extern "system" fn() -> *const u16)()
+        }
+        #[cfg(not(windows))]
+        std::ptr::null()
+    }
+}
+
+pub extern "system" fn GetCommandLineA() -> *const c_char {
+    if let Some(a) = COMMAND_LINE_A.get() {
+        a.as_ptr().cast()
+    } else {
+        #[cfg(windows)]
+        {
+            crate::modules::files::host!("kernel32.dll", "GetCommandLineA": extern "system" fn() -> *const c_char)()
+        }
+        #[cfg(not(windows))]
+        std::ptr::null()
+    }
+}
+
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
 pub(crate) fn module() -> HleModule {
@@ -382,6 +420,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(GetCommandLineW),
+            hle_export!(GetCommandLineA),
         ],
     }
 }

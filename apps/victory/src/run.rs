@@ -11,10 +11,28 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    skip_boot: bool,
+    title_args: Vec<String>,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+
+    let should_skip_boot = skip_boot || std::env::var_os("VICTORY_SKIP_BOOT").is_some_and(|v| v != "0");
+    if should_skip_boot {
+        println!("boot           skipping intro videos and boot screen");
+        unsafe { std::env::set_var("VICTORY_SKIP_BOOT", "1") };
+    }
+
+    let mut cmdline = format!("\"{}\"", exe.display());
+    if should_skip_boot {
+        cmdline.push_str(" -skipintro -novid -nointro -straightintofreemode");
+    }
+    for arg in &title_args {
+        cmdline.push(' ');
+        cmdline.push_str(arg);
+    }
+    victory_hle::modules::kernel::set_command_line(&cmdline);
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -345,6 +363,14 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: bool,
+    _: Vec<String>,
+) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

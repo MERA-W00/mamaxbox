@@ -33,7 +33,7 @@ pub mod device;
 #[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
-mod fpsbox;
+pub mod fpsbox;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]

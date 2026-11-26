@@ -23,6 +23,42 @@ static MS_TENTHS: AtomicU32 = AtomicU32::new(333);
 /// Average draw calls per frame.
 static DRAWS: AtomicU32 = AtomicU32::new(21);
 
+/// Global GPU overload fail-safe state
+static GPU_OVERLOAD: AtomicBool = AtomicBool::new(false);
+static OVERLOAD_MESSAGE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Global skip-boot preference (defaults to true if VICTORY_SKIP_BOOT != "0")
+static SKIP_BOOT: AtomicBool = AtomicBool::new(true);
+
+pub fn is_gpu_overloaded() -> bool {
+    GPU_OVERLOAD.load(Ordering::Relaxed)
+}
+
+pub fn overload_reason() -> Option<String> {
+    OVERLOAD_MESSAGE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn trigger_gpu_overload(reason: &str) {
+    GPU_OVERLOAD.store(true, Ordering::Relaxed);
+    let mut msg = OVERLOAD_MESSAGE.lock().unwrap_or_else(|e| e.into_inner());
+    *msg = Some(reason.to_string());
+    tracing::error!("GPU OVERLOAD FAIL-SAFE TRIGGERED: {reason}");
+}
+
+pub fn clear_gpu_overload() {
+    GPU_OVERLOAD.store(false, Ordering::Relaxed);
+    let mut msg = OVERLOAD_MESSAGE.lock().unwrap_or_else(|e| e.into_inner());
+    *msg = None;
+}
+
+pub fn is_skip_boot() -> bool {
+    SKIP_BOOT.load(Ordering::Relaxed)
+}
+
+pub fn set_skip_boot(val: bool) {
+    SKIP_BOOT.store(val, Ordering::Relaxed);
+}
+
 /// Whether the dropdown menu is dropped down / open.
 static MENU_OPEN: AtomicBool = AtomicBool::new(true);
 /// Whether the entire overlay / dropdown menu is hidden (toggled via F3).
@@ -678,7 +714,13 @@ pub(crate) fn draw(
         return;
     }
     check_keys();
-    if HUD_HIDDEN.load(Ordering::Relaxed) {
+    if HUD_HIDDEN.load(Ordering::Relaxed) && !GPU_OVERLOAD.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if GPU_OVERLOAD.load(Ordering::Relaxed) {
+        let reason = overload_reason().unwrap_or_else(|| "GPU compute pipeline or driver overload".to_string());
+        draw_overload_screen(host, list, back, (width, height, format), &reason);
         return;
     }
 
@@ -797,6 +839,146 @@ pub(crate) fn draw(
         list.CopyTextureRegion(&to, x_pos, y_pos, 0, &from, None);
     }
 }
+
+/// Renders a full-screen solid black canvas with a centered high-contrast GPU overload warning dialog.
+fn draw_overload_screen(
+    host: &crate::host::Host,
+    list: &ID3D12GraphicsCommandList,
+    back: &ID3D12Resource,
+    (width, height, format): (u32, u32, DXGI_FORMAT),
+    reason: &str,
+) {
+    let Some(bytes) = pixel_bytes(format) else { return };
+    let scale = (height / 540).clamp(2, 4);
+
+    let mut clean_reason = reason.replace('\n', " ").replace('\r', "");
+    if clean_reason.len() > 64 {
+        clean_reason.truncate(61);
+        clean_reason.push_str("...");
+    }
+
+    let lines = vec![
+        "===================================================================".to_string(),
+        "                [!] GPU OVERLOAD / FAULT DETECTED                  ".to_string(),
+        "===================================================================".to_string(),
+        "".to_string(),
+        "  CRITICAL FAIL-SAFE: GRAPHICS PIPELINE SUSPENDED TO PREVENT TDR   ".to_string(),
+        "".to_string(),
+        format!("  REASON : {}", clean_reason),
+        "".to_string(),
+        "  PROBABLE CAUSES:".to_string(),
+        "   - Resolution set too high for GPU VRAM / hardware capability".to_string(),
+        "   - Intensive compute shaders or unbuilt BVH ray-tracing traversal".to_string(),
+        "   - Host Vulkan / D3D12 driver pipeline compilation exception".to_string(),
+        "".to_string(),
+        "  FAIL-SAFE RECOVERY CONTROLS:".to_string(),
+        "   * [F2] : Open Settings Menu (Switch to 1080p / Disable Dynamic RT)".to_string(),
+        "   * [F1] : Lower FPS Cap (e.g. 30 FPS / 60 FPS)".to_string(),
+        "   * [F3] : Hide / Show Warning Screen".to_string(),
+        "".to_string(),
+        "===================================================================".to_string(),
+    ];
+
+    let (dlg_w, dlg_h, lit, hl) = bitmap(&lines, scale);
+    let pitch = (width as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
+    let total_bytes = pitch * height as usize;
+
+    let Some((buffer, data)) = host.shared_buffer(total_bytes as u64) else { return };
+    let out = unsafe { std::slice::from_raw_parts_mut(data, total_bytes) };
+
+    // Fill the entire canvas with solid black (0, 0, 0, 255)
+    for y in 0..height as usize {
+        let row_start = y * pitch;
+        for x in 0..width as usize {
+            let at = row_start + x * bytes;
+            match format {
+                DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => {
+                    out[at..at + bytes].copy_from_slice(&[0, 0, 0, 255]);
+                }
+                DXGI_FORMAT_R10G10B10A2_UNORM => {
+                    out[at..at + bytes].copy_from_slice(&[0, 0, 0, 0b11000000]);
+                }
+                DXGI_FORMAT_R16G16B16A16_FLOAT => {
+                    out[at..at + bytes].fill(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Center warning box on the black screen
+    let start_x = (width.saturating_sub(dlg_w)) / 2;
+    let start_y = (height.saturating_sub(dlg_h)) / 2;
+
+    for dy in 0..dlg_h as usize {
+        let py = start_y as usize + dy;
+        if py >= height as usize { break; }
+        for dx in 0..dlg_w as usize {
+            let px = start_x as usize + dx;
+            if px >= width as usize { break; }
+            let at = py * pitch + px * bytes;
+            let is_lit = lit[dy * dlg_w as usize + dx];
+            let is_hl = hl[dy * dlg_w as usize + dx];
+            pixel(format, is_lit, is_hl, &mut out[at..at + bytes]);
+        }
+    }
+
+    unsafe {
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&buffer),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: format,
+                        Width: width,
+                        Height: height,
+                        Depth: 1,
+                        RowPitch: pitch as u32,
+                    },
+                },
+            },
+        };
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(back),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+    }
+}
+
+/// Fallback GDI painter for when the D3D12 device has been removed or invalidated.
+#[cfg(windows)]
+pub fn paint_gdi_overload(hwnd: windows::Win32::Foundation::HWND, reason: &str) {
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::Foundation::COLORREF;
+    unsafe {
+        let hdc = GetDC(Some(hwnd));
+        if !hdc.is_invalid() {
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rc);
+            let brush = CreateSolidBrush(COLORREF(0x00000000));
+            FillRect(hdc, &rc, brush);
+            let _ = DeleteObject(brush.into());
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(0x0033DDFF)); // Warm amber/gold
+
+            let text = format!(
+                "\r\n\r\n\r\n   [!] GPU OVERLOAD / FAULT DETECTED\r\n\r\n   The GPU compute pipeline encountered a critical load fault:\r\n   {}\r\n\r\n   Fail-safe engaged: The game screen has been blanked to prevent TDR driver crash.\r\n   Resolution or Ray Tracing settings exceeded hardware capacity.\r\n   Press F2 to lower resolution, or restart with lower display settings.",
+                reason
+            );
+            let mut wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+            let len = wide.len().saturating_sub(1);
+            DrawTextW(hdc, &mut wide[..len], &mut rc, DT_CENTER | DT_WORDBREAK);
+            ReleaseDC(Some(hwnd), hdc);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn paint_gdi_overload(_hwnd: (), _reason: &str) {}
 
 #[cfg(test)]
 mod tests {
