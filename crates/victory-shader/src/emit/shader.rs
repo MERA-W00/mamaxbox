@@ -176,6 +176,7 @@ impl Shader {
         let i8 = m.int(8);
         let i32 = m.int(32);
         let f32 = m.float();
+        m.metadata();
         let i8p = m.ptr(i8);
         let handle = m.named_struct("dx.types.Handle", vec![i8p]);
         let props = m.named_struct("dx.types.ResourceProperties", vec![i32, i32]);

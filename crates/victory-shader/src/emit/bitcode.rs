@@ -36,6 +36,7 @@ enum TypeDef {
     Struct(Option<String>, Vec<Ty>),
     Array(u32, Ty),
     Func(Ty, Vec<Ty>),
+    Metadata,
 }
 
 /// A value: a global variable, a function, a module constant, or an
@@ -247,6 +248,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn metadata(&mut self) -> Ty {
+        self.ty(TypeDef::Metadata)
     }
     pub fn double(&mut self) -> Ty {
         self.ty(TypeDef::Double)
@@ -501,19 +505,23 @@ impl Module {
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {
+        self.metadata();
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
     }
     pub fn md_value(&mut self, v: V) -> Md {
+        self.metadata();
         let ty = self.type_of(v);
         self.mds.push(MdDef::Value(ty, v));
         Md(self.mds.len() as u32 - 1)
     }
     pub fn md_node(&mut self, ops: Vec<Option<Md>>) -> Md {
+        self.metadata();
         self.mds.push(MdDef::Node(ops));
         Md(self.mds.len() as u32 - 1)
     }
     pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
+        self.metadata();
         self.named.push((name.into(), nodes));
     }
 
@@ -602,6 +610,7 @@ impl Module {
                     r.extend(params.iter().map(|p| u64::from(p.0)));
                     w.record(21, &r);
                 }
+                TypeDef::Metadata => w.record(16, &[]),
             }
         }
         w.exit();
@@ -675,8 +684,20 @@ impl Module {
                 Const::Int(v) => w.record(4, &[signed(*v)]),
                 Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
                 Const::Aggregate(ids) => {
-                    let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
-                    w.record(7, &r);
+                    if matches!(self.types[ty.0 as usize], TypeDef::Array(..)) {
+                        let mut r = Vec::with_capacity(ids.len());
+                        for &i in ids {
+                            match self.consts[i as usize].1 {
+                                Const::Int(v) => r.push(v as u64),
+                                Const::Float(bits) => r.push(u64::from(bits)),
+                                _ => panic!("unsupported element in constant array"),
+                            }
+                        }
+                        w.record(22, &r);
+                    } else {
+                        let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
+                        w.record(7, &r);
+                    }
                 }
             }
         }

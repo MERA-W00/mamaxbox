@@ -74,6 +74,60 @@ pub fn set_graphs_visible(val: bool) {
 static CPU_HISTORY: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static GPU_HISTORY: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
+/// Hardware part names for CPU & GPU
+static CPU_NAME: Mutex<Option<String>> = Mutex::new(None);
+static GPU_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_gpu_name(name: &str) {
+    let mut lock = GPU_NAME.lock().unwrap_or_else(|e| e.into_inner());
+    *lock = Some(name.to_string());
+}
+
+pub fn get_gpu_name() -> String {
+    let lock = GPU_NAME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref name) = *lock {
+        return name.clone();
+    }
+    "Direct3D 12 GPU".to_string()
+}
+
+pub fn detect_cpu_name() -> String {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let highest = core::arch::x86_64::__cpuid(0x80000000).eax;
+        if highest >= 0x80000004 {
+            let mut brand = [0u8; 48];
+            for i in 0..3usize {
+                let res = core::arch::x86_64::__cpuid(0x80000002 + i as u32);
+                let bytes = [
+                    res.eax.to_le_bytes(),
+                    res.ebx.to_le_bytes(),
+                    res.ecx.to_le_bytes(),
+                    res.edx.to_le_bytes(),
+                ].concat();
+                brand[i * 16..(i + 1) * 16].copy_from_slice(&bytes);
+            }
+            if let Ok(s) = std::str::from_utf8(&brand) {
+                let trimmed = s.trim().trim_matches('\0').trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    "x86_64 CPU".to_string()
+}
+
+pub fn get_cpu_name() -> String {
+    let mut lock = CPU_NAME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref name) = *lock {
+        return name.clone();
+    }
+    let detected = detect_cpu_name();
+    *lock = Some(detected.clone());
+    detected
+}
+
 /// Toast notification message displayed temporarily in the HUD overlay
 static TOAST: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
 
@@ -976,14 +1030,24 @@ fn render_graphs_bitmap(cpu_hist: &[u8], gpu_hist: &[u8], scale: u32) -> (u32, u
     let cpu_cur = *cpu_hist.last().unwrap_or(&30);
     let gpu_cur = *gpu_hist.last().unwrap_or(&35);
 
+    let cpu_name = get_cpu_name();
+    let gpu_name = get_gpu_name();
+
+    let clean_cpu = cpu_name.replace("(R)", "").replace("(TM)", "");
+    let clean_cpu = clean_cpu.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clean_gpu = gpu_name.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let cpu_label = if clean_cpu.len() > 32 { &clean_cpu[..32] } else { &clean_cpu };
+    let gpu_label = if clean_gpu.len() > 32 { &clean_gpu[..32] } else { &clean_gpu };
+
     let lines = vec![
-        "-- [F4] HARDWARE MONITORS ----------------------".to_string(),
-        format!(" CPU LOAD: {:>3}%  [SYSTEM THREADS]             ", cpu_cur),
-        "                                                ".to_string(), // Row 2: CPU Graph Plot Area
-        format!(" GPU LOAD: {:>3}%  [D3D12 SCARLETT ENGINE]      ", gpu_cur),
-        "                                                ".to_string(), // Row 4: GPU Graph Plot Area
-        "================================================".to_string(),
-        " [F4: HIDE/SHOW GRAPHS]                         ".to_string(),
+        "--- [F4] HARDWARE MONITORS -----------------------------".to_string(),
+        format!(" CPU LOAD: {:>3}%  [{:<32}]", cpu_cur, cpu_label),
+        "                                                        ".to_string(), // Row 2: CPU Graph Plot Area
+        format!(" GPU LOAD: {:>3}%  [{:<32}]", gpu_cur, gpu_label),
+        "                                                        ".to_string(), // Row 4: GPU Graph Plot Area
+        "========================================================".to_string(),
+        " [F4: HIDE/SHOW GRAPHS]                                 ".to_string(),
     ];
 
     let (w, h, mut lit, mut hl) = bitmap(&lines, scale);

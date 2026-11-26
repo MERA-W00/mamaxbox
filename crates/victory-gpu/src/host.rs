@@ -695,6 +695,7 @@ fn create() -> windows::core::Result<Host> {
                         let mut dev: Option<ID3D12Device> = None;
                         if D3D12CreateDevice(&adapter, fl, &mut dev).is_ok() && dev.is_some() {
                             tracing::info!(name = %name, feature_level = format_args!("{fl:?}"), "selected host D3D12 adapter");
+                            crate::fpsbox::set_gpu_name(&name);
                             device = dev;
                             chosen_adapter = adapter.cast::<IDXGIAdapter3>().ok();
                             break;
