@@ -16,7 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -69,11 +69,233 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // Not through `OnceLock::get_or_init`: a worker the driver's compiler
+        // crashed under stays inside the call for good (see [`guard_start`]),
+        // and anyone else asking would wait for it forever.
+        if self.made.get().is_none() {
+            let made = if is_bad_key(&self.key) {
+                SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                None
+            } else {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            };
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+/// Pipelines not made for being on the list of those the driver's compiler
+/// crashes on.
+static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
+
+/// The keys of the pipelines the driver's compiler crashed on (`warm-bad.txt`
+/// beside the pipeline library, one key per line; `#` starts a comment), loaded
+/// on first use. `VICTORY_WARM_BAD=0` leaves the file unread.
+static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = keys.get_or_insert_with(|| {
+        if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+            return Default::default();
+        }
+        let listed = super::library::folder()
+            .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
+            .unwrap_or_default();
+        listed
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_owned)
+            .collect()
+    });
+    f(keys)
+}
+
+fn is_bad_key(key: &str) -> bool {
+    bad_keys(|keys| keys.contains(key))
+}
+
+/// Whether driver shader-compiler crashes on pipeline workers are caught
+/// (`VICTORY_COMPILER_GUARD=0`: off).
+fn guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPILER_GUARD").is_none_or(|v| v != "0"))
+}
+
+const MAX_SLOTS: usize = 128;
+static CRASHED: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
+static FAULT_CODE: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_JOBS: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    static COMPILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct Compile {
+    slot: usize,
+}
+
+impl Compile {
+    fn begin(slot: usize, p: &Arc<Pending>) -> Compile {
+        if slot < MAX_SLOTS && guard_on() {
+            let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if jobs.len() < MAX_SLOTS {
+                jobs.resize(MAX_SLOTS, None);
+            }
+            jobs[slot] = Some(p.clone());
+            COMPILING.set(true);
+        }
+        Compile { slot }
+    }
+}
+
+impl Drop for Compile {
+    fn drop(&mut self) {
+        if COMPILING.replace(false) && self.slot < MAX_SLOTS {
+            let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(job) = jobs.get_mut(self.slot) {
+                *job = None;
+            }
+        }
+    }
+}
+
+/// Installs a lock-free Vectored Exception Handler that catches driver shader
+/// compiler crashes on pipeline worker threads (NVIDIA `libnvidia-gpucomp.so`
+/// `ILLEGAL_INSTRUCTION` / `ud2` under Proton/vkd3d-proton, and AMD
+/// `ACCESS_VIOLATION` on low addresses). The handler does no allocation or
+/// locking: it records the fault, wakes `victory-pipeline-watch`, and parks
+/// the crashed worker while the watcher records the pipeline in `warm-bad.txt`
+/// and spawns a replacement worker.
+fn guard_start() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if !guard_on() {
+        return;
+    }
+    ONCE.call_once(|| {
+        // SAFETY: an unnamed auto-reset event, no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if event.is_null() {
+            tracing::warn!("no event for driver compiler crashes: they are not caught");
+            return;
+        }
+        CRASH_EVENT.store(event as usize, Ordering::Release);
+        let spawned = std::thread::Builder::new().name("victory-pipeline-watch".into()).spawn(watch);
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no watcher thread for driver compiler crashes: they are not caught");
+            return;
+        }
+        // SAFETY: handler lives for the process lifetime.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        }
+        tracing::info!("driver compiler crash guard active on pipeline workers (VICTORY_COMPILER_GUARD=0: off)");
+    });
+}
+
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::System::Threading::{SetEvent, Sleep};
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    const ILLEGAL_INSTRUCTION: i32 = 0xc000_001d_u32 as i32;
+    const CONTINUE_SEARCH: i32 = 0;
+    // SAFETY: the OS passes a live exception record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let is_low_av = record.ExceptionCode == ACCESS_VIOLATION
+        && record.NumberParameters >= 2
+        && record.ExceptionInformation[1] < 0x10000;
+    let is_sigill = record.ExceptionCode == ILLEGAL_INSTRUCTION;
+    if !is_low_av && !is_sigill {
+        return CONTINUE_SEARCH;
+    }
+    if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
+        return CONTINUE_SEARCH;
+    }
+    let slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
+    if slot >= MAX_SLOTS {
+        return CONTINUE_SEARCH;
+    }
+    let _ = COMPILING.try_with(|c| c.set(false));
+    FAULT_CODE[slot].store(record.ExceptionCode as u32 as u64, Ordering::Relaxed);
+    let addr = if record.NumberParameters >= 2 { record.ExceptionInformation[1] as u64 } else { 0 };
+    FAULT_ADDR[slot].store(addr, Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the OS passes a live context record.
+    FAULT_RIP[slot].store(unsafe { (*(*info).ContextRecord).Rip }, Ordering::Relaxed);
+    CRASHED[slot].store(true, Ordering::Release);
+    let event = CRASH_EVENT.load(Ordering::Acquire);
+    if event != 0 {
+        // SAFETY: event lives for the process lifetime.
+        unsafe { SetEvent(event as windows_sys::Win32::Foundation::HANDLE) };
+    }
+    loop {
+        // SAFETY: park this thread permanently so it never unwinds through corrupted driver state.
+        unsafe { Sleep(u32::MAX - 1) };
+    }
+}
+
+fn watch() {
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    loop {
+        let event = CRASH_EVENT.load(Ordering::Acquire);
+        // SAFETY: event lives for the process lifetime.
+        unsafe { WaitForSingleObject(event as windows_sys::Win32::Foundation::HANDLE, INFINITE) };
+        for slot in 0..MAX_SLOTS {
+            if CRASHED[slot].swap(false, Ordering::AcqRel) {
+                lost(slot);
+            }
+        }
+    }
+}
+
+fn lost(slot: usize) {
+    let job = {
+        let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.get_mut(slot).and_then(Option::take)
+    };
+    let Some(p) = job else {
+        return;
+    };
+    tracing::error!(
+        key = p.key,
+        shaders = ?p.shaders,
+        code = format_args!("{:#x}", FAULT_CODE[slot].load(Ordering::Relaxed)),
+        rip = format_args!("{:#x}", FAULT_RIP[slot].load(Ordering::Relaxed)),
+        address = format_args!("{:#x}", FAULT_ADDR[slot].load(Ordering::Relaxed)),
+        "driver shader compiler crashed making a pipeline: skipping it and spawning replacement worker"
+    );
+    let known = bad_keys(|keys| !keys.insert(p.key.clone()));
+    if !known && let Some(dir) = super::library::folder() {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
+        if let Ok(mut f) = file {
+            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+        }
+    }
+    let _ = p.made.set(None);
+    {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    }
+    if !spawn_worker() {
+        tracing::warn!("failed to spawn replacement pipeline worker after compiler crash");
     }
 }
 
@@ -363,33 +585,46 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
+        guard_start();
+        for _ in 0..workers {
+            if spawn_worker() {
                 running = true;
             }
         }
         running
     })
+}
+
+fn spawn_worker() -> bool {
+    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{slot}"))
+        .spawn(move || {
+            WORKER_SLOT.set(slot);
+            // Below the title's own threads (loading, recording).
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            loop {
+                let p = next();
+                let _compile = Compile::begin(slot, &p);
+                p.make();
+                drop(_compile);
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+        false
+    } else {
+        true
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

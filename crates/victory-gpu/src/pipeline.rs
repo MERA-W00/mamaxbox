@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// ([`Shader::walks`]).
     #[cfg(windows)]
     walks: OnceLock<bool>,
+    /// Role in the indirect-lighting ambient stand-in (`crate::ambient`), if any.
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Role>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +122,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
+                #[cfg(windows)]
+                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
             })
         })
         .clone()
