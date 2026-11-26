@@ -41,14 +41,14 @@ fn plane_resource(p: &Parameters) -> Option<(This, Option<[i32; 4]>)> {
 
 pub(crate) fn snapshot(count: u32, p: *const crate::queue::Plane) -> Option<Vec<Layer>> {
     static ON: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("VICTORY_PRESENT_PLANES").is_some_and(|v| v == "1"));
+        LazyLock::new(|| !std::env::var_os("VICTORY_PRESENT_PLANES").is_some_and(|v| v == "0"));
     if !*ON || count < 2 || p.is_null() {
         return None;
     }
     // SAFETY: the title supplied count records. No title pointers used by
     // the worker survive this call except id, which is only logged.
     let planes = unsafe { std::slice::from_raw_parts(p.cast::<Parameters>(), count as usize) };
-    planes
+    let layers: Option<Vec<Layer>> = planes
         .iter()
         .map(|p| {
             let (id, crop) = plane_resource(p)?;
@@ -58,7 +58,11 @@ pub(crate) fn snapshot(count: u32, p: *const crate::queue::Plane) -> Option<Vec<
                 crop,
             })
         })
-        .collect()
+        .collect();
+    if let Some(ref list) = layers {
+        tracing::debug!(count, layers = list.len(), "multiplane snapshot acquired");
+    }
+    layers
 }
 
 fn uv(crop: Option<[i32; 4]>, w: u32, h: u32) -> [f32; 4] {
@@ -229,11 +233,19 @@ pub(crate) fn record(
         // view that changes the type of a fully typed resource.
         let srv = match desc.Format.0 {
             27 | 28 => DXGI_FORMAT_R8G8B8A8_UNORM,
+            29 => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
             87 | 90 => DXGI_FORMAT_B8G8R8A8_UNORM,
+            88 | 92 => DXGI_FORMAT_B8G8R8X8_UNORM,
+            91 => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            93 => DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
             23 | 24 => DXGI_FORMAT_R10G10B10A2_UNORM,
+            89 => DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
             9 | 10 => DXGI_FORMAT_R16G16B16A16_FLOAT,
-            29 | 91 => desc.Format,
-            _ => return false,
+            11 => DXGI_FORMAT_R16G16B16A16_UNORM,
+            f => {
+                tracing::warn!(format = f, "dxgi planes: unsupported scan-out layer format");
+                return false;
+            }
         };
         inputs.push((srv, uv(layer.crop, desc.Width as u32, desc.Height)));
     }

@@ -113,7 +113,7 @@ def get_game_window_geom():
     return None
 
 
-def run_debug_cycle(max_wait_seconds=180):
+def run_debug_cycle(max_wait_seconds=360):
     print("\n" + "=" * 65)
     print("=== Starting Recursive Debug Cycle for MamaXbox ===")
     print("=" * 65)
@@ -156,6 +156,8 @@ def run_debug_cycle(max_wait_seconds=180):
     env["VICTORY_PIPELINE_WAIT_MS"] = "4"
     env["VICTORY_PIPELINE_WAIT_ONCE_MS"] = "500"
     env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148,2486510c8afeef34,f607be37ee4fba77,656fdcac1e85f2ea"
+    env["VICTORY_PRESENT_PLANES"] = "1"
+    env["VICTORY_FPS_COUNTER"] = "1"
 
     print(f"[Supervisor] Launching {LAUNCHER}...", file=sys.stderr)
     proc = subprocess.Popen([LAUNCHER], env=env, preexec_fn=os.setsid)

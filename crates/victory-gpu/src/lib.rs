@@ -24,6 +24,8 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+pub mod fpsbox;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 #[cfg(windows)]

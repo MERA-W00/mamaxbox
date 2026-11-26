@@ -222,31 +222,56 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
+/// Available display resolutions selectable from the performance overlay dropdown menu.
+pub const SUPPORTED_RESOLUTIONS: &[(u32, u32, &str)] = &[
+    (1920, 1200, "1200p (16:10 Initial)"),
+    (1920, 1080, "1080p (FHD)"),
+    (2560, 1440, "1440p (QHD)"),
+    (3840, 2560, "2560p (16:10 UHD)"),
+    (3840, 2160, "4K (UHD)"),
+];
+
+static CURRENT_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1920);
+static CURRENT_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1200);
+
+/// Current display resolution reported to the title and swapchain.
+pub fn current_display_size() -> (u32, u32) {
+    display_size()
+}
+
+/// Dynamically update the active display resolution from the performance overlay.
+pub fn set_display_size(width: u32, height: u32) {
+    CURRENT_WIDTH.store(width, std::sync::atomic::Ordering::Relaxed);
+    CURRENT_HEIGHT.store(height, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(width, height, "display resolution updated dynamically");
+}
+
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
-/// if set (as a console reports the television it is plugged into: a
-/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
-/// shortcut: not yet the host display's own size by default; make it so
-/// once a title is seen to render for the mode it is given.
+/// if set, else defaults to 1920x1200.
 fn display_size() -> (u32, u32) {
-    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
         let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
             let (w, h) = v.trim().split_once(['x', 'X'])?;
             Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
         });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
-        size
-    })
+        if let Some((w, h)) = asked {
+            if (640..=7680).contains(&w) && (360..=4320).contains(&h) {
+                CURRENT_WIDTH.store(w, std::sync::atomic::Ordering::Relaxed);
+                CURRENT_HEIGHT.store(h, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let w = CURRENT_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+        let h = CURRENT_HEIGHT.load(std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(width = w, height = h, "initial display mode reported to the title");
+    });
+    (
+        CURRENT_WIDTH.load(std::sync::atomic::Ordering::Relaxed),
+        CURRENT_HEIGHT.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// The console's mode list reporting 1200p, 1080p, 1440p, 2560p, and 4K at 60 Hz and 120 Hz.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -258,26 +283,39 @@ extern "system" fn modes(
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
+    let total_modes = (SUPPORTED_RESOLUTIONS.len() * 2) as u32;
     if out.is_null() {
-        *count = 1;
+        *count = total_modes;
         return S_OK;
     }
     if *count < 1 {
         return MORE_DATA;
     }
-    *count = 1;
-    let (width, height) = display_size();
-    let mode = Mode {
-        width,
-        height,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1, // progressive
-        scaling: 0,
-        flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
+    let to_write = (*count).min(total_modes);
+    let mut written = 0;
+    for &(w, h, _) in SUPPORTED_RESOLUTIONS {
+        for &rate in &[60, 120] {
+            if written >= to_write {
+                break;
+            }
+            let mode = Mode {
+                width: w,
+                height: h,
+                refresh: [rate, 1],
+                format: 0,
+                scanlines: 1, // progressive
+                scaling: 0,
+                flags: 0,
+            };
+            // SAFETY: checked non-null; room for `to_write` modes.
+            unsafe { out.add(written as usize).write(mode) };
+            written += 1;
+        }
+        if written >= to_write {
+            break;
+        }
+    }
+    *count = written;
     S_OK
 }
 

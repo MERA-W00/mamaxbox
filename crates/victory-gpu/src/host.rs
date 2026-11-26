@@ -436,16 +436,18 @@ fn card_clock_watch(clock: &'static CardClock) {
 }
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
-/// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+/// frame's time. Returns the card busy percentage (0.0..=100.0).
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
     let [idle, behind, stood] = [0, 1, 2].map(|i| crate::monitor::log_count(&CARD_CLOCK_US[i], &LAST[i]) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
          had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+        busy
     );
+    busy
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -642,6 +644,7 @@ fn create() -> windows::core::Result<Host> {
                         let mut dev: Option<ID3D12Device> = None;
                         if D3D12CreateDevice(&adapter, fl, &mut dev).is_ok() && dev.is_some() {
                             tracing::info!(name = %name, feature_level = format_args!("{fl:?}"), "selected host D3D12 adapter");
+                            crate::fpsbox::set_gpu_name(&name);
                             device = dev;
                             chosen_adapter = adapter.cast::<IDXGIAdapter3>().ok();
                             break;
@@ -8380,6 +8383,8 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        let frame = crate::frame::current();
+        crate::fpsbox::set_metrics(fps, ms, draws, frame);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -8415,7 +8420,9 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
-        card_clock_line(frames, ms);
+        let card_busy = card_clock_line(frames, ms);
+        let gpu_busy_pct = card_busy.round().clamp(1.0, 99.0) as u8;
+        crate::fpsbox::record_gpu_sample(gpu_busy_pct);
         frame_wait::line(frames);
         crate::shadow::parallel::line(frames);
         crate::watch::guard_line(frames);
@@ -8794,12 +8801,12 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            let previous = if composed {
-                D3D12_RESOURCE_STATE_COPY_SOURCE
-            } else {
-                D3D12_RESOURCE_STATE_COPY_DEST
-            };
-            let leave_back = transition(&back, previous, D3D12_RESOURCE_STATE_PRESENT);
+            if composed {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            let (width, height) = (p.width, p.height);
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
+            let leave_back = transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
             let frame_slot = match source {
                 PresentSource::Planes(_, slot) => {
                     list.ResourceBarrier(&[leave_back]);
