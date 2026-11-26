@@ -113,7 +113,7 @@ def get_game_window_geom():
     return None
 
 
-def run_debug_cycle(max_wait_seconds=600):
+def run_debug_cycle(max_wait_seconds=180):
     print("\n" + "=" * 65)
     print("=== Starting Recursive Debug Cycle for MamaXbox ===")
     print("=" * 65)
@@ -126,16 +126,24 @@ def run_debug_cycle(max_wait_seconds=600):
 
     env = os.environ.copy()
     env["VICTORY_AUTO_A"] = "1"
+    env["VICTORY_FPS_LIMIT"] = "60"
+    env["VICTORY_STACKS"] = "20,35"
+    env["VICTORY_WALLS_TRACE"] = "1"
     env["VICTORY_TEXTURE_BUDGET_MB"] = "10240"
     env["VICTORY_TEXTURE_ROOM_PERCENT"] = "96"
     env["VICTORY_CARD_WINDOWS_MB"] = "4096"
-    env["VICTORY_CARD_BUFFERS_MB"] = "3072"
+    env["VICTORY_CARD_BUFFERS_MB"] = "4096"
     env["VICTORY_CARD_ROOM_FOR_TARGETS_MB"] = "1024"
     env["VICTORY_WINDOW_UPLOAD"] = "1"
     env["VICTORY_TEXTURE_SWEEP"] = "0"
     env["VICTORY_CARD_ACCOUNTING"] = "1"
-    env["VICTORY_PIPELINE_WORKERS"] = "4"
-    env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148,2486510c8afeef34,f607be37ee4fba77,656fdcac1e85f2ea,dc33a831d92addd1,88994c3496045f51,02384a60fda6f2d0,13dfdd3b1136e407"
+    env["VICTORY_QUEUE2"] = "3"
+    env["VICTORY_QUEUE2_LANDING_MB"] = "256"
+    env["VKD3D_CONFIG"] = "upload_hvv"
+    env["__GL_THREADED_OPTIMIZATIONS"] = "1"
+    env["VICTORY_PIPELINE_WORKERS"] = "8"
+    env["VICTORY_DRIVER_COMPILE_LOCK"] = "1"
+    env["VICTORY_SKIP_PIPELINES"] = "4e296b1885c37b29,8bb272e763f76148,2486510c8afeef34,f607be37ee4fba77,656fdcac1e85f2ea"
 
     print(f"[Supervisor] Launching {LAUNCHER}...", file=sys.stderr)
     proc = subprocess.Popen([LAUNCHER], env=env, preexec_fn=os.setsid)
@@ -178,9 +186,20 @@ def run_debug_cycle(max_wait_seconds=600):
                         menu_loaded = True
 
             now = time.time()
-            # If screen is open, capture screen and run OCR periodically
+            # If screen is open, monitor GPU status periodically
             if screen_opened and (now - last_shot_time >= 5.0):
                 last_shot_time = now
+                try:
+                    smi = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu", "--format=csv,noheader,nounits"],
+                        text=True,
+                        timeout=2,
+                    ).strip()
+                    parts = [p.strip() for p in smi.split(",")]
+                    if len(parts) >= 5:
+                        print(f"[GPU Monitor t+{now - start_time:.0f}s] GPU Util: {parts[0]}% | VRAM: {parts[1]}MB / {parts[2]}MB | Power: {parts[3]}W | Temp: {parts[4]}°C", file=sys.stderr)
+                except Exception:
+                    pass
                 try:
                     geom = get_game_window_geom()
                     if geom:
@@ -196,6 +215,9 @@ def run_debug_cycle(max_wait_seconds=600):
 
                     subprocess.run(["tesseract", "/tmp/gta6_screen_latest.png", "/tmp/gta6_ocr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     ocr_text = Path("/tmp/gta6_ocr.txt").read_text(errors="replace").strip()
+                    for line in ocr_text.splitlines():
+                        if "SCARLETT HUD" in line or "FPS" in line:
+                            print(f"[HUD t+{now - start_time:.0f}s] {line.strip()}", file=sys.stderr)
                     cleaned_lines = [l.strip() for l in ocr_text.splitlines() if l.strip() and not l.startswith("SCARLETT HUD")]
                     if cleaned_lines:
                         sample = " | ".join(cleaned_lines[:4])
@@ -206,7 +228,8 @@ def run_debug_cycle(max_wait_seconds=600):
             # If screen is open, pulse A / X periodically
             if screen_opened and (now - last_click_time >= 1.5):
                 last_click_time = now
-                print(f"[Supervisor] Sending A/X input (wtype Return + UDP 0x4) at t+{now - start_time:.1f}s", file=sys.stderr)
+                if int(now - start_time) % 15 == 0:
+                    print(f"[Supervisor] Sending A/X input (wtype Return + UDP 0x4) at t+{now - start_time:.1f}s", file=sys.stderr)
                 focus_game_window()
                 send_pad_click(BUTTON_A)
                 send_pad_click(BUTTON_X)

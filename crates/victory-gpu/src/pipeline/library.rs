@@ -432,6 +432,18 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Driver pipeline state creation lock (`VICTORY_DRIVER_COMPILE_LOCK=0`: off).
+/// On Linux NVIDIA drivers (libnvidia-gpucomp.so) under Wine/Proton, concurrent pipeline compilation
+/// across multiple threads can cause heap corruption and access violations (0xc0000005).
+/// Serializing driver compilation prevents these crashes while still allowing multi-threaded
+/// shader translation.
+fn driver_compile_lock() -> Option<MutexGuard<'static, ()>> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static LOCK: Mutex<()> = Mutex::new(());
+    ON.get_or_init(|| std::env::var_os("VICTORY_DRIVER_COMPILE_LOCK").is_none_or(|v| v != "0"))
+        .then(|| LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// A library the driver refused, kept as it was ([`open`]).
 const REJECTED_FILE: &str = "host-pipelines.rejected.bin";
@@ -545,6 +557,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _driver_lock = driver_compile_lock();
         return create();
     };
     let began = std::time::Instant::now();
@@ -568,8 +581,9 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compiled under driver_compile_lock to prevent driver compiler concurrency crashes.
     let pso = {
+        let _driver_lock = driver_compile_lock();
         let _call = call("make", name);
         create()?
     };

@@ -254,21 +254,7 @@ unsafe extern "system" fn compiler_crashed(
     let mut slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
     let compiling_on_thread = COMPILING.try_with(|c| c.get()).unwrap_or(false);
     if !compiling_on_thread || slot >= MAX_SLOTS {
-        // Exception occurred on a driver helper thread (e.g. libnvidia-gpucomp.so)
-        // or a thread without WORKER_SLOT set. Check if any worker is actively compiling.
-        let mut active_slot = usize::MAX;
-        let mut active_count = 0;
-        for s in 0..MAX_SLOTS {
-            if ACTIVE_SLOTS[s].load(Ordering::Acquire) {
-                active_count += 1;
-                active_slot = s;
-            }
-        }
-        if active_count == 0 {
-            // No pipeline compilation in flight: this is an unrelated exception.
-            return CONTINUE_SEARCH;
-        }
-        slot = active_slot;
+        return CONTINUE_SEARCH;
     }
     let _ = COMPILING.try_with(|c| c.set(false));
     ACTIVE_SLOTS[slot].store(false, Ordering::Release);
