@@ -189,11 +189,11 @@ pub(crate) fn sync_heaps() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
-    // VICTORY_DESCRIPTOR_SYNC_BATCH=1 takes the slot lock once per group
-    // of at most 64 contiguous snapshots. Default: one slot at a time.
+    // VICTORY_DESCRIPTOR_SYNC_BATCH=0 disables batching; default takes the slot
+    // lock once per group of at most 64 contiguous snapshots.
     static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let batch = *BATCH.get_or_init(|| {
-        std::env::var_os("VICTORY_DESCRIPTOR_SYNC_BATCH").is_some_and(|v| v == "1")
+        std::env::var_os("VICTORY_DESCRIPTOR_SYNC_BATCH").is_none_or(|v| v != "0")
     });
     sync_heaps_with_mode(batch, incremental_mirror());
 }
@@ -201,7 +201,7 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 fn incremental_mirror() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_INCREMENTAL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_INCREMENTAL").is_none_or(|v| v != "0"))
 }
 
 /// The identity is in the first twelve bytes. Read a straddling identity on
@@ -588,7 +588,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 #[cfg(windows)]
 pub(crate) fn compact_tables() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_TABLE_KEYS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_TABLE_KEYS").is_none_or(|v| v != "0"))
 }
 
 /// Releasing an object can invalidate its descriptor without changing the

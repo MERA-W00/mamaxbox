@@ -370,46 +370,26 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device method 0x1c8 asks for a pipeline state. The description is
-/// still unknown. Keep the first samples so its layout can be identified.
+/// Device method 0x1c8: console precompiled graphics pipeline lookup.
+/// Returning `E_NOTIMPL` signals a precompiled cache miss so the title falls
+/// back to `create_graphics` (0x50) or `create_stream` (0x2b0), matching 0x218.
 extern "system" fn unknown_pipeline(
     _: This,
-    desc: *const u8,
+    _desc: *const u8,
     _iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: AtomicU32 = AtomicU32::new(0);
-    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MISSES: AtomicU64 = AtomicU64::new(0);
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
-    if calls <= 4 || calls.is_power_of_two() {
-        // Sixteen 64-bit words at `at`, read through the kernel: neither
-        // pointer is known to be mapped.
-        #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>().0.iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
-                    .collect()
-            })
-        };
-        #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description
-            .as_ref()
-            .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
-            slot = "0x1c8",
-            calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+    let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if misses.is_power_of_two() {
+        tracing::info!(
+            misses,
+            "precompiled graphics cache miss at 0x1c8; the caller falls back to shader containers"
         );
     }
     E_NOTIMPL

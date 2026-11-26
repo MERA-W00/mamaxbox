@@ -2967,9 +2967,12 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use, ensuring
+/// `ALLOW_UNORDERED_ACCESS` (0x4) when `unordered` is true while sharing the
+/// same `PLACED_TEXTURES` slot between SRV and UAV views at `address`.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], unordered: bool) -> Option<This> {
+    const ALLOW_UAV: u32 = 0x4;
     // Words 1 and 13 of the description are the filler of its layout
     // (after the dimension, and at the end): the title leaves there what
     // its stack held, and two views of one texture that differed only in
@@ -2983,7 +2986,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[1] = 0;
         key[13] = 0;
     }
-    let desc = &key;
+    // Normalize UAV flag out of lookup key so SRV + UAV views share one resource.
+    let mut lookup_key = key;
+    lookup_key[12] &= !ALLOW_UAV;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
@@ -3001,13 +3006,24 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             }
         }
     }
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+    if let Some(&r) = map.get(&(address, lookup_key)).or_else(|| map.get(&(address, key))) {
+        let existing = r as This;
+        let needs_upgrade = unordered
+            && host_resource(existing).is_some_and(|tex| {
+                // SAFETY: live D3D12 resource.
+                (unsafe { tex.GetDesc() }.Flags.0 as u32 & ALLOW_UAV) == 0
+            });
+        if !needs_upgrade {
+            return Some(existing);
+        }
     }
     // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut d = unsafe { key.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    if unordered {
+        d.flags |= ALLOW_UAV;
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
@@ -3022,8 +3038,11 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
-    crate::texture::placed_in_host_written(address, desc);
+    map.insert((address, lookup_key), out as usize);
+    if lookup_key != key {
+        map.insert((address, key), out as usize);
+    }
+    crate::texture::placed_in_host_written(address, &key);
     resource(out)
         .host
         .placed

@@ -638,23 +638,48 @@ pub(crate) fn pipeline(
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let Some(dir) = DIR.get() else { return };
-    // Only one publisher may use the two temporary files. Periodic callers
-    // are pipeline workers and can leave an in-progress save to its owner.
-    let mut last = if now {
-        LAST.lock().unwrap_or_else(|e| e.into_inner())
-    } else {
-        match LAST.try_lock() {
-            Ok(last) => last,
-            Err(std::sync::TryLockError::WouldBlock) => return,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+    if !now {
+        {
+            let Ok(mut last) = LAST.try_lock() else { return };
+            if last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+                return;
+            }
+            if IN_FLIGHT.swap(true, Ordering::Acquire) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
         }
-    };
-    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        // Run periodic saves on a background thread so pipeline workers never stall on disk I/O.
+        let spawned = std::thread::Builder::new()
+            .name("victory-pipeline-save".into())
+            .spawn(move || {
+                struct Reset;
+                impl Drop for Reset {
+                    fn drop(&mut self) {
+                        IN_FLIGHT.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = Reset;
+                save_inner(dir);
+            });
+        if spawned.is_err() {
+            IN_FLIGHT.store(false, Ordering::Release);
+        }
         return;
     }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    while IN_FLIGHT.swap(true, Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     *last = Some(std::time::Instant::now());
+    save_inner(dir);
+    IN_FLIGHT.store(false, Ordering::Release);
+}
+
+fn save_inner(dir: &'static PathBuf) {
     if precompile::tracking() && !precompile::writer(dir) { return; }
     if warm_enabled()
         && let Err(error) = save_warm(dir)
@@ -663,7 +688,7 @@ pub(crate) fn save(now: bool) {
     }
     static EARLY_WITHOUT_LIBRARY: OnceLock<bool> = OnceLock::new();
     let early_without_library = *EARLY_WITHOUT_LIBRARY.get_or_init(|| {
-        std::env::var_os("VICTORY_PIPELINE_EARLY_WITHOUT_LIBRARY").is_some_and(|value| value == "1")
+        std::env::var_os("VICTORY_PIPELINE_EARLY_WITHOUT_LIBRARY").is_none_or(|value| value != "0")
     });
     let lib = library();
     let snapshot = precompile::snapshot();
@@ -836,10 +861,11 @@ pub(super) fn warm_enabled() -> bool {
 }
 
 /// Recording needs one relaxed increment per lookup. Starting the reader
-/// also creates live host objects during play, so that work stays opt-in.
+/// prewarms saved pipeline recipes off-thread during initial loading so
+/// entering the 3D world finds host pipelines already built (`VICTORY_PIPELINE_WARMUP=0`: off).
 pub(super) fn replay_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    warm_enabled() && *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WARMUP").is_some_and(|v| v == "1"))
+    warm_enabled() && *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WARMUP").is_none_or(|v| v != "0"))
 }
 
 /// Approach after XCL 354ce0c: record the pipelines requested by a bind.
@@ -969,7 +995,17 @@ fn rank(rows: HashMap<String, u64>) -> Vec<(String, u64)> {
 
 /// Save complete inputs before publishing their key in the order file.
 /// Each distinct shader container takes space once across all recipes.
+#[cfg(test)]
 fn write_recipe(dir: &Path, p: &Pending, shaders: &mut HashSet<blake3::Hash>) -> io::Result<u64> {
+    write_recipe_cached(dir, p, shaders, None)
+}
+
+fn write_recipe_cached(
+    dir: &Path,
+    p: &Pending,
+    shaders: &mut HashSet<blake3::Hash>,
+    existing: Option<&HashMap<String, u64>>,
+) -> io::Result<u64> {
     let mut written = 0;
     let count = u8::try_from(p.shaders.len()).map_err(|_| invalid())?;
     if count == 0 || usize::from(count) > STAGES.len() {
@@ -983,10 +1019,19 @@ fn write_recipe(dir: &Path, p: &Pending, shaders: &mut HashSet<blake3::Hash>) ->
             .ok_or_else(invalid)?;
         let hash = blake3::hash(&s.container);
         if !shaders.contains(&hash) {
-            let path = dir.join(hash.to_hex().as_str());
-            if !matches_file(&path, &s.container) {
-                publish(&path, &s.container)?;
-                written += s.container.len() as u64;
+            let hex = hash.to_hex();
+            let hex_str = hex.as_str();
+            let already_on_disk = match existing {
+                // Content-addressed by full 256-bit BLAKE3: matching non-zero file size guarantees presence.
+                Some(files) => !s.container.is_empty() && files.get(hex_str) == Some(&(s.container.len() as u64)),
+                None => matches_file(&dir.join(hex_str), &s.container),
+            };
+            if !already_on_disk {
+                let path = dir.join(hex_str);
+                if existing.is_none() || !matches_file(&path, &s.container) {
+                    publish(&path, &s.container)?;
+                    written += s.container.len() as u64;
+                }
             }
             shaders.insert(hash);
         }
@@ -999,7 +1044,8 @@ fn write_recipe(dir: &Path, p: &Pending, shaders: &mut HashSet<blake3::Hash>) ->
     let checksum = blake3::hash(&bytes);
     bytes.extend_from_slice(checksum.as_bytes());
     let path = dir.join(&p.key);
-    if !matches_file(&path, &bytes) {
+    let need_check = existing.is_none_or(|files| files.get(&p.key) == Some(&(bytes.len() as u64)));
+    if !need_check || !matches_file(&path, &bytes) {
         publish(&path, &bytes)?;
         written += bytes.len() as u64;
     }
@@ -1145,6 +1191,18 @@ fn save_entries(dir: &Path, entries: Vec<Arc<WarmEntry>>) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::InvalidData => Vec::new(),
         result => result?,
     };
+    // Pre-scan directory metadata once so existing content-addressed shader blobs skip file opens.
+    let existing: HashMap<String, u64> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|res| {
+            let entry = res.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            let len = entry.metadata().ok()?.len();
+            Some((name, len))
+        })
+        .collect();
     // An entry unseen this run remains available behind every observed one.
     let mut rows: HashMap<_, _> = prior.into_iter().map(|(key, _)| (key, 0)).collect();
     let mut shaders = HashSet::new();
@@ -1154,7 +1212,7 @@ fn save_entries(dir: &Path, entries: Vec<Arc<WarmEntry>>) -> io::Result<()> {
             if p.shaders.is_empty() {
                 continue;
             }
-            match write_recipe(dir, p, &mut shaders) {
+            match write_recipe_cached(dir, p, &mut shaders, Some(&existing)) {
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
                 result => payload_bytes += result?,
             }

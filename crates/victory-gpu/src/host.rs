@@ -3956,7 +3956,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -4386,7 +4386,7 @@ impl Host {
                 // landed plan. Off until measured across comparable runs.
                 results: kelvaroq_render::compare_slots::CompareSlots::new(
                     (RESULTS / 4) as u32,
-                    std::env::var_os("VICTORY_RECYCLE_COMPARE_SLOTS").is_some_and(|v| v == "1"),
+                    std::env::var_os("VICTORY_RECYCLE_COMPARE_SLOTS").is_none_or(|v| v != "0"),
                 ),
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },

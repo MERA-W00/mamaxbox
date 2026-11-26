@@ -242,11 +242,42 @@ mod x64 {
         }
     }
 
+    const SMALL_SLOTS: usize = 64;
+
     thread_local! {
-        /// Page of this thread's last successful small kernel read. This
-        /// is only a hint to try the protected copy instruction. Bytes and
-        /// access rights are never cached, as the title can write or unmap.
-        static LAST_PAGE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        /// Direct-mapped cache of pages validated by a recent kernel read on
+        /// this thread. This is only a hint to try the protected copy
+        /// instruction across interleaved descriptor/constant pages without
+        /// 30,000+ ReadProcessMemory syscalls/frame. Bytes and access rights
+        /// are never cached, as the title can write or unmap (`on_fault` catches it).
+        static SMALL_PAGES: std::cell::Cell<[usize; SMALL_SLOTS]> =
+            const { std::cell::Cell::new([usize::MAX; SMALL_SLOTS]) };
+    }
+
+    #[inline]
+    fn page_slot(page: usize) -> usize {
+        (page ^ (page >> 6) ^ (page >> 12)) & (SMALL_SLOTS - 1)
+    }
+
+    fn has_small_page(page: usize) -> bool {
+        let table = SMALL_PAGES.get();
+        table[page_slot(page)] == page
+    }
+
+    fn set_small_page(page: usize, valid: bool) {
+        let mut table = SMALL_PAGES.get();
+        let slot = page_slot(page);
+        if valid {
+            table[slot] = page;
+        } else if table[slot] == page {
+            table[slot] = usize::MAX;
+        }
+        SMALL_PAGES.set(table);
+    }
+
+    #[cfg(test)]
+    fn clear_small_pages() {
+        SMALL_PAGES.set([usize::MAX; SMALL_SLOTS]);
     }
 
     fn small_reads() -> bool {
@@ -261,8 +292,10 @@ mod x64 {
     }
 
     pub(super) fn note_kernel_read(src: *const u8, len: usize, copied: bool) {
-        if (2..256).contains(&len) && small_reads() {
-            LAST_PAGE.set(if copied { small_page(src, len) } else { None });
+        if (2..256).contains(&len) && small_reads()
+            && let Some(page) = small_page(src, len)
+        {
+            set_small_page(page, copied);
         }
     }
 
@@ -278,7 +311,7 @@ mod x64 {
         if len < 256
             && (len <= 1
                 || !small_reads()
-                || !LAST_PAGE.get().is_some_and(|page| small_page(src, len) == Some(page)))
+                || !small_page(src, len).is_some_and(has_small_page))
         {
             return Path::Small;
         }
@@ -289,6 +322,11 @@ mod x64 {
         match unsafe { victory_plain_copy(dst, src, len) } {
             0 => Path::Plain,
             fault => {
+                if len < 256
+                    && let Some(page) = small_page(src, len)
+                {
+                    set_small_page(page, false);
+                }
                 faults.remember(fault - 1, now_ms());
                 Path::Fault
             }
@@ -310,7 +348,7 @@ mod x64 {
         #[test]
         fn cold_reads_under_256_bytes_stay_with_the_kernel() {
             assert!(install());
-            LAST_PAGE.set(None);
+            clear_small_pages();
             let src = [0xb5; 257];
             let faults = Faults::new();
             for n in [0, 1, 255, 256, 257] {
@@ -348,7 +386,7 @@ mod x64 {
                 });
                 bytes
             };
-            LAST_PAGE.set(None);
+            clear_small_pages();
             assert_eq!(read(0, 2), [0x67; 2]);
             // SAFETY: an ordinary write between the two reads.
             unsafe { src.add(16).write(0xb5) };
@@ -374,7 +412,7 @@ mod x64 {
                 let at = VirtualAlloc(std::ptr::null(), PAGE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 assert!(!at.is_null());
                 assert!(crate::host::read_into(at.cast(), &mut dst));
-                LAST_PAGE.set(Some(at as usize / PAGE));
+                set_small_page(at as usize / PAGE, true);
                 assert_ne!(VirtualFree(at, PAGE, MEM_DECOMMIT), 0);
                 assert_eq!(attempt(at.cast(), dst.as_mut_ptr(), 1, &faults), Path::Small);
                 let path = attempt(at.cast(), dst.as_mut_ptr(), dst.len(), &faults);

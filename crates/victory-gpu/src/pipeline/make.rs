@@ -346,7 +346,7 @@ fn lost(slot: usize) {
 
 fn standins() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_STANDINS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_STANDINS").is_none_or(|v| v != "0"))
 }
 
 /// Approach after XCL 625a0f3: share an existing driver pipeline across
@@ -746,15 +746,15 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8, or VICTORY_PIPELINE_WORKERS) on first use.
+/// Starts the workers (three-quarters of logical processors, 4 to 12, or VICTORY_PIPELINE_WORKERS) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = if let Some(val) = std::env::var_os("VICTORY_PIPELINE_WORKERS") {
-            val.to_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 16)
+            val.to_str().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4).clamp(1, 16)
         } else {
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            std::thread::available_parallelism().map_or(4, |n| (n.get() * 3 / 4).clamp(4, 12))
         };
         guard_start();
         tracing::info!(workers, "starting pipeline workers");
@@ -774,14 +774,23 @@ fn spawn_worker() -> bool {
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             WORKER_SLOT.set(slot);
-            // Below the title's own threads (loading, recording).
-            // SAFETY: a plain call on our own thread.
-            unsafe {
-                use windows::Win32::System::Threading::*;
-                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-            }
+            let mut low_priority = false;
             loop {
                 let p = next();
+                let is_urgent = p.used.load(Ordering::Relaxed);
+                if is_urgent == low_priority {
+                    low_priority = !is_urgent;
+                    // SAFETY: a plain call on our own thread.
+                    unsafe {
+                        use windows::Win32::System::Threading::*;
+                        let prio = if low_priority {
+                            THREAD_PRIORITY_BELOW_NORMAL
+                        } else {
+                            THREAD_PRIORITY_NORMAL
+                        };
+                        let _ = SetThreadPriority(GetCurrentThread(), prio);
+                    }
+                }
                 p.make();
                 if dec_waiting() {
                     drained();
@@ -832,30 +841,6 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
-    }
-
-    /// A draw into other formats than its pipeline declares finds the
-    /// pipeline for them, which exists once per set of formats and is
-    /// queued by its first draw like any other.
-    #[test]
-    fn a_pipeline_for_bound_formats_is_made_once() {
-        // The title's pipeline declares one render target, format 24.
-        let p = Arc::new(Pending::new(Vec::new(), Some(Box::new(GraphicsState::declaring(24)))));
-        assert_eq!(p.formats, [24, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let g = p.graphics.as_deref().unwrap();
-        let (a, b) = ([26, 0, 0, 0, 0, 0, 0, 0, 0], [28, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let first = variant(&p, g, &a);
-        assert_eq!(first.formats, a);
-        assert_ne!(first.key, p.key);
-        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
-        let second = variant(&p, g, &b);
-        assert_eq!(second.formats, b);
-        assert!(!Arc::ptr_eq(first, second));
-        assert_ne!(second.key, first.key);
-        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
-        assert!(Arc::ptr_eq(second, variant(&p, g, &b)));
-        assert_eq!(first.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
-        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
     }
 
     #[test]

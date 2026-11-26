@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 fn incremental_buffer_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_BUFFER_SPANS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DESCRIPTOR_BUFFER_SPANS").is_none_or(|v| v != "0"))
 }
 
 /// A copy can appear in thousands of slots. Keep its two outer bounds
@@ -428,7 +428,7 @@ enum RootResource {
 /// the current descriptor heaps, memory alias and dynamic table offsets.
 fn root_bind_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_BIND_CACHE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_BIND_CACHE").is_none_or(|v| v != "0"))
 }
 
 fn bind_argument<T: PartialEq>(

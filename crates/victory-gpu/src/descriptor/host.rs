@@ -821,11 +821,10 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
+        let views = [UNCAPPED_VIEWS, 1 << 20, PORTABLE_VIEWS]
+            .into_iter()
+            .find(|&n| fits(n))
+            .unwrap_or(PORTABLE_VIEWS);
         tracing::info!(
             views,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
@@ -835,17 +834,10 @@ pub(crate) fn probe_view_limit() {
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made
-/// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released.
-/// 2^16 ran out in the world ("no free dynamic descriptor slots", run 11;
-/// upstream PR #336 takes 2^18). On a host heap capped at 1,000,000 views
-/// (NVIDIA) these come out of the title's slots, whose highest seen is
-/// about 720,000: 2^17 left 868,000 of them, and ran out in the opening
-/// cutscene (a frame asks for up to 16,000 tables while the frame before
-/// still holds its own; a draw refused its table read slots never made
-/// for it, and the card stopped within frames). 2^18 leaves 737,000; a
-/// table past them is made afresh in these slots like any other.
-pub(crate) const DYNAMIC: u32 = 1 << 18;
+/// afresh. With `VICTORY_DIRECT_CONSTANTS=1` (root CBVs), frames only need
+/// ~14-22 dynamic tables/frame, so `1 << 16` (65,536) leaves ~3,000x headroom
+/// while reclaiming +196,608 bindless view slots for the title's 1.24M heap.
+pub(crate) const DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -1087,7 +1079,7 @@ impl HostHeap {
         let n = n as usize;
         static CROSS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let cross = *CROSS.get_or_init(|| {
-            std::env::var_os("VICTORY_DESCRIPTOR_CURSOR_RUN").is_some_and(|v| v == "1")
+            std::env::var_os("VICTORY_DESCRIPTOR_CURSOR_RUN").is_none_or(|v| v != "0")
         });
         let found = if enough {
             dynamic_run(&taken[..self.dynamic as usize], *next as usize, n, cross)
@@ -2039,7 +2031,8 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let placed_uav_tex = matches!(view, View::Placed(true, resource, _) if resource[0] != 1);
+            let later = !for_draw && !placed_uav_tex && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -3012,19 +3005,24 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in memory
+/// itself, as a view of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource, *unordered)?;
+    let words = desc[..10].try_into().ok();
+    if *unordered {
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

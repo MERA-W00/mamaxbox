@@ -848,7 +848,7 @@ fn guard_view(start: usize, end: usize, arm_aliases: bool) -> Option<Vec<usize>>
 
 fn batch_guards() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_GUARDS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_GUARDS").is_none_or(|v| v != "0"))
 }
 
 static GUARD_BATCHES: [std::sync::atomic::AtomicU64; 3] =
@@ -1231,7 +1231,7 @@ mod scoped;
 
 pub fn scoped_remap() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SCOPED_REMAP").is_some_and(|s| s == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SCOPED_REMAP").is_none_or(|s| s != "0"))
 }
 
 /// What the runtime holds while it changes what title memory shows

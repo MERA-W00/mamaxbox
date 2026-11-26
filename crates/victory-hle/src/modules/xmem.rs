@@ -888,7 +888,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     // VICTORY_SCATTER_RUNS=1 amortizes both locks over at most 64 entries.
     // Install each page as its own Windows view, as in scalar Scatter.
     static GROUP: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var_os("VICTORY_SCATTER_RUNS").is_some_and(|v| v == "1")
+        std::env::var_os("VICTORY_SCATTER_RUNS").is_none_or(|v| v != "0")
     });
     scatter_pages(addresses, n, pages, *GROUP)
 }
@@ -938,7 +938,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // les alias identiques. Le chemin du fork reste le défaut (0) en
     // attendant la comparaison sur les images lourdes.
     static GROUP: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var_os("VICTORY_PAGE_MAPPING_RUNS").is_some_and(|v| v == "1")
+        std::env::var_os("VICTORY_PAGE_MAPPING_RUNS").is_none_or(|v| v != "0")
     });
     let (to, from, len) = (to as usize, from as usize, len as usize);
     if lazy::enabled() {
