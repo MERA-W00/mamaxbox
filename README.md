@@ -1,6 +1,6 @@
 # **cuba libre**
 
-# mamaxbox (isopod)
+# mamaxbox
 
 > **Experimental Xbox Series X|S (Scarlett) Compatibility & Recompilation Layer for Arch Linux**  
 > *Capa experimental de compatibilidad y recompilación de Xbox Series X|S para sistemas basados en Arch Linux*
