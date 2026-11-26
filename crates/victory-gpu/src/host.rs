@@ -9,10 +9,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::{
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
+};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -642,6 +645,7 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        let mut chosen_adapter: Option<IDXGIAdapter3> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
@@ -649,8 +653,63 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+            chosen_adapter = adapter.cast::<IDXGIAdapter3>().ok();
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Enumerate DXGI adapters to prioritize discrete, high-performance hardware GPUs
+            // (e.g. NVIDIA/AMD over integrated Intel graphics). On hybrid laptops, passing
+            // None picks Adapter 0 (the integrated GPU), which often fails D3D12 Feature Level 12.0
+            // and results in a disabled host device and blank display.
+            if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                let mut candidates: Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> = Vec::new();
+                let mut i = 0;
+                while let Ok(adapter) = factory.EnumAdapters1(i) {
+                    if let Ok(desc) = adapter.GetDesc1() {
+                        let is_software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
+                            || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c);
+                        if !is_software {
+                            candidates.push((adapter, desc));
+                        }
+                    }
+                    i += 1;
+                }
+
+                // Prioritize discrete GPUs with the most dedicated VRAM
+                candidates.sort_by(|a, b| b.1.DedicatedVideoMemory.cmp(&a.1.DedicatedVideoMemory));
+
+                for (adapter, desc) in candidates {
+                    let null_idx = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                    let name = String::from_utf16_lossy(&desc.Description[..null_idx]);
+                    tracing::info!(
+                        name = %name,
+                        vram_mb = desc.DedicatedVideoMemory / (1024 * 1024),
+                        vendor = format_args!("{:#x}", desc.VendorId),
+                        "probing DXGI adapter for host D3D12 device"
+                    );
+
+                    let feature_levels = [
+                        D3D_FEATURE_LEVEL_12_0,
+                        D3D_FEATURE_LEVEL_11_1,
+                        D3D_FEATURE_LEVEL_11_0,
+                    ];
+                    for fl in feature_levels {
+                        let mut dev: Option<ID3D12Device> = None;
+                        if D3D12CreateDevice(&adapter, fl, &mut dev).is_ok() && dev.is_some() {
+                            tracing::info!(name = %name, feature_level = format_args!("{fl:?}"), "selected host D3D12 adapter");
+                            device = dev;
+                            chosen_adapter = adapter.cast::<IDXGIAdapter3>().ok();
+                            break;
+                        }
+                    }
+                    if device.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            if device.is_none() {
+                tracing::warn!("no enumerated adapter matched; attempting D3D12CreateDevice with default adapter");
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -719,9 +778,11 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
-            .ok();
+        let adapter = chosen_adapter.or_else(|| {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+                .ok()
+        });
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -8712,6 +8773,9 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_ERASEBKGND {
+        return LRESULT(1);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -8727,6 +8791,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             hInstance: instance.into(),
             lpszClassName: CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
             ..Default::default()
         };
         RegisterClassExW(&class);
