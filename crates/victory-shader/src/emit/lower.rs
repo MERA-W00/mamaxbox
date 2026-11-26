@@ -27,6 +27,100 @@ pub(super) mod intersect;
 
 type Why = &'static str;
 
+/// Approach after XCL ea088a5: some drivers clamp an out-of-range mip and
+/// return its dimensions. The console keeps the level count and zeros all
+/// three sizes, including the layer count.
+/// Approach after XCL 71d94e7: the depth of a non-array 1D or 2D image is zero.
+/// Approach after XCL f884dc5: a 1D array reports its layers in both y and z.
+pub(super) fn resinfo_sizes(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    kind: u32,
+    dimensions: [V; 4],
+    mip_to_check: Option<V>,
+    console_shape: bool,
+) -> [V; 4] {
+    let [width, height, depth, levels] = dimensions;
+    let zero = m.i32(0);
+    let one = m.i32(1);
+    let mut sizes = match kind {
+        1 => [width, one, if console_shape { zero } else { one }],
+        2 => [width, height, if console_shape { zero } else { one }],
+        3 => [width, height, zero],
+        5 => [width, height, if console_shape { m.i32(6) } else { one }],
+        6 => [width, height, if console_shape { height } else { one }],
+        _ => [width, height, depth],
+    };
+    if let Some(mip) = mip_to_check {
+        let exists = m.cmp(block, pred::IULT, mip, levels);
+        for size in &mut sizes {
+            *size = m.select(block, exists, *size, zero);
+        }
+    }
+    let levels = if matches!(kind, 3 | 8) { one } else { levels };
+    [sizes[0], sizes[1], sizes[2], levels]
+}
+
+/// Approach after XCL 4070ae1: D16 resource queries pack selected integer
+/// sizes into consecutive halves. An odd component leaves its upper half zero.
+pub(super) fn packed_resinfo(
+    m: &mut super::bitcode::Module,
+    block: usize,
+    components: &[V],
+) -> Vec<V> {
+    let mask = m.i32(0xffff);
+    let shift = m.i32(16);
+    components
+        .chunks(2)
+        .map(|pair| {
+            let low = m.bin(block, Bin::And, pair[0], mask);
+            if let Some(&upper) = pair.get(1) {
+                let high = m.bin(block, Bin::Shl, upper, shift);
+                m.bin(block, Bin::Or, low, high)
+            } else {
+                low
+            }
+        })
+        .collect()
+}
+
+/// Approach after XCL 3eab40a: each primitive index uses nine bits in a
+/// ten-bit field. Counting the reserved bit can cull a valid primitive.
+fn primitive_index_mask(nine_bits: bool) -> u32 {
+    if nine_bits { 0x1ff } else { 0x3ff }
+}
+
+/// Approach after XCL 83ad6a5: a compute dispatch that communicates through
+/// the title address space can require visibility across workgroups. Limit
+/// the coherent UAV property to windows used by such programs.
+fn window_properties<'a>(
+    compute: bool,
+    instructions: impl Iterator<Item = (&'a str, &'a Fields)>,
+) -> u32 {
+    const RAW_UAV: u32 = 0x100b;
+    const GLOBALLY_COHERENT: u32 = 1 << 14;
+    if compute {
+        for (name, fields) in instructions {
+            let invalidates = matches!(
+                name,
+                "buffer_gl0_inv" | "buffer_gl1_inv" | "s_gl1_inv" | "s_dcache_inv"
+            );
+            let needs_visibility = match fields {
+                Fields::Buffer { cache, .. }
+                | Fields::Flat { cache, .. }
+                | Fields::Smem { cache, .. } => {
+                    cache.glc || cache.slc || cache.dlc || name.contains("_atomic_")
+                }
+                _ => false,
+            };
+            if invalidates || needs_visibility {
+                return RAW_UAV | GLOBALLY_COHERENT;
+            }
+        }
+    }
+    RAW_UAV
+}
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -179,6 +273,7 @@ fn half_shift(width: u32) -> u32 {
 
 struct Lower<'a> {
     s: Shader,
+    window_properties: u32,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
@@ -945,10 +1040,22 @@ pub fn set_host_max_wave(lanes: u32) {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn with_paired<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PAIRED.set(self.0);
+        }
+    }
+    let _reset = Reset(PAIRED.replace(true));
+    f()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1016,6 +1123,17 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// An identically empty mask has zero in both halves even inside a lane
+/// branch. Set `VICTORY_WAVE_ZERO_MASK=0` to exercise the ballot path.
+fn zero_mask_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_none_or(|v| v != "0"))
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -1046,6 +1164,8 @@ pub(super) fn host_max_wave() -> u32 {
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static TEST_ZERO_MASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
@@ -1258,6 +1378,13 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        static COHERENCE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_COMPUTE_WINDOW_COHERENCE").is_some_and(|v| v == "1")
+        });
+        let window_properties = window_properties(
+            matches!(x.native.io, StageIo::Cs(_)) && *COHERENCE,
+            insts().map(|i| (i.name(), &i.fields)),
+        );
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1300,7 +1427,8 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            console_lanes |= PAIRED.get();
+            if wave == 64 && host_max_wave() == 32 && !PAIRED.get() && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1484,6 +1612,7 @@ impl<'a> Lower<'a> {
         }
         Lower {
             s,
+            window_properties,
             x,
             bad,
             lane_fail: HashMap::new(),
@@ -2191,6 +2320,8 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        let paired = PAIRED.get();
+        let mut lane_regions = Vec::new();
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2254,7 +2385,18 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                let before = self.cur;
+                if paired && matches!(p.blocks[b].insts[i].fields, Fields::Ds { .. }) {
+                    // A single physical wave issues both halves of an LDS
+                    // access. Finish the preceding access before a lane
+                    // can read a word that its partner wrote.
+                    let fence = self.s.m.i32(8);
+                    self.s.op(before, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[fence]);
+                }
                 self.inst(b, i)?;
+                if paired && before != self.cur {
+                    lane_regions.push((before, self.cur));
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2278,6 +2420,9 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if paired {
+            super::bitcode::paired::run(&mut self.s, &lane_regions, &self.tail).map_err(|why| unsupported(0, why))?;
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -2795,6 +2940,13 @@ impl<'a> Lower<'a> {
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+        let (handle, byte, _) = self.memory_entry(lo, hi, guard);
+        (handle, byte)
+    }
+
+    /// The copy number is zero for a missing page. A BVH walker needs this
+    /// distinction because zero is a valid child pointer in a box node.
+    fn memory_entry(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2852,11 +3004,13 @@ impl<'a> Lower<'a> {
         );
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        let h = self
+            .s
+            .heap_handle(c, slot, false, true, (self.window_properties, 0));
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        (h, byte, copy)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -3106,14 +3260,51 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A scalar copy preserves both dwords even when some lanes skip the
+    /// copy. If its source was written in the entry block, both host waves
+    /// can ballot it there before the branch.
+    fn entry_mask_copied_by(&self, block: usize, lo: Value) -> Option<Value> {
+        let inst = self.x.p.blocks[block]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        let operand = match (inst.name(), src.as_slice()) {
+            ("s_mov_b64", [a]) => a,
+            ("s_and_b64" | "s_or_b64", [a, b]) if a == b => a,
+            _ => return None,
+        };
+        let Operand::Scalar { code, .. } = *operand else { return None };
+        let source = inst.read(Reg::S(code))?;
+        let high = inst.read(Reg::S(code.checked_add(1)?))?;
+        (self.x.p.blocks[0].preds.is_empty()
+            && self.def_block.get(&source) == Some(&0)
+            && self.x.st.highs.get(&high) == Some(&source)
+            && self.x.st.active.contains(&source))
+            .then_some(source)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
-        let (lo, high) = match self.x.st.highs.get(&v) {
+        let (mut lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
+        if !self.local
+            && self.exchange.as_ref().is_some_and(|e| !e.1)
+            && let Some(&block) = self.def_block.get(&lo)
+            && !self.all_lanes(block)
+            && let Some(source) = self.entry_mask_copied_by(block, lo)
+        {
+            lo = source;
+        }
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        // No lane contributes a bit to an identically empty mask. Either dword
+        // is zero even when the other half of a console wave skips this block.
+        if m == Bool::FALSE && zero_mask_on() {
+            return Ok(self.s.m.i32(0));
+        }
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
@@ -9394,7 +9585,16 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
+        /// Approach after XCL a334936: a multisampled view has one mip.
+        /// Its DXIL dimensions query takes no mip operand and returns the
+        /// sample count where a regular texture returns its level count.
+        static MSAA_INFO: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_RESINFO_MSAA").is_some_and(|v| v == "1")
+        });
+        let ms_info = *dim >= 6 && name == "image_get_resinfo" && *MSAA_INFO;
         let (kind, coords) = match dim {
+            6 if ms_info => (3, 2),
+            7 if ms_info => (8, 3),
             0 => (1, 1),
             1 => (2, 2),
             2 => (4, 3),
@@ -9619,36 +9819,65 @@ impl<'a> Lower<'a> {
             _ => return Err(name),
         };
         if op == 72 {
-            // Width, height, depth or layers, levels (per dmask) of the level
-            // in the first address: DXIL's dimensions; a channel DXIL leaves
-            // out reads 1 (UAVs: one level).
+            static BOUNDS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("VICTORY_RESINFO_MIP_BOUNDS").is_some_and(|v| v == "1")
+            });
+            static SHAPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("VICTORY_RESINFO_SHAPE").is_some_and(|v| v == "1")
+            });
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            if ms_info && uav {
+                return Err("a multisampled UAV");
+            }
+            let requested = if !ms_info && (!uav || *BOUNDS) {
+                Some(addr_val(self, 0)?)
+            } else {
+                None
+            };
+            let mip = if uav || ms_info {
                 self.s.m.undef(self.s.t.i32)
             } else {
-                addr_val(self, 0)?
+                requested.unwrap()
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
             let d = self
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-            let one = self.s.m.i32(1);
-            let present = match kind {
-                1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
-                _ => [true, true, true, true],
-            };
+            let dimensions = std::array::from_fn(|i| {
+                if uav && i == 3 {
+                    self.s.m.i32(1)
+                } else {
+                    self.s.m.extract(c, d, i as u32)
+                }
+            });
+            let sizes = resinfo_sizes(
+                &mut self.s.m,
+                c,
+                kind,
+                dimensions,
+                requested.filter(|_| *BOUNDS),
+                *SHAPE,
+            );
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
-            for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
-                    one
-                } else {
-                    self.s.m.extract(c, d, ch)
-                };
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            static PACK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("VICTORY_RESINFO_D16").is_some_and(|v| v == "1")
+            });
+            let channels = sizes
+                .into_iter()
+                .enumerate()
+                .filter_map(|(ch, size)| (dmask >> ch & 1 != 0).then_some(size));
+            if *d16 && *PACK {
+                let packed = packed_resinfo(&mut self.s.m, c, &channels.collect::<Vec<_>>());
+                for (k, x) in packed.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+            } else {
+                for (k, x) in channels.enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
             }
             return Ok(());
         }
@@ -10915,8 +11144,12 @@ impl<'a> Lower<'a> {
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
         let mut indices = [z; 3];
+        static NINE_BITS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_MESH_PRIM_9BIT").is_some_and(|v| v == "1")
+        });
+        let mask = self.s.m.i32(primitive_index_mask(*NINE_BITS));
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let shift = self.s.m.i32(10 * k as u32);
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
@@ -11300,6 +11533,16 @@ mod tests {
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     #[test]
+    fn primitive_index_padding_is_independent_for_all_three_vertices() {
+        let packed = 0x201 | (0x302 << 10) | (0x3ff << 20);
+        let decode = |nine| {
+            [0, 10, 20].map(|shift: u32| (packed >> shift) & super::primitive_index_mask(nine))
+        };
+        assert_eq!(decode(true), [1, 258, 511]);
+        assert_eq!(decode(false), [513, 770, 1023]);
+    }
+
+    #[test]
     fn packed_pixel_inputs_find_their_second_row() {
         use super::super::container::SigElement;
         use super::half_input_partners;
@@ -11512,6 +11755,38 @@ mod tests {
             base_register: 0,
             user_data,
             slot,
+        }
+    }
+
+    #[test]
+    fn only_compute_windows_with_cross_group_visibility_are_coherent() {
+        use super::window_properties;
+        use crate::gfx10::{Fields, Operand};
+        let read = |glc| Fields::Smem {
+            data: None,
+            base: Operand::Const(0),
+            offset: 0,
+            soffset: Operand::Const(0),
+            cache: crate::gfx10::Cache {
+                glc,
+                ..Default::default()
+            },
+        };
+        for (name, fields, expected) in [
+            ("s_load_dword", read(false), 0x100b),
+            ("s_load_dword", read(true), 0x500b),
+            ("s_atomic_add", read(false), 0x500b),
+            ("buffer_gl1_inv", Fields::Sopp { imm: 0 }, 0x500b),
+            ("s_barrier", Fields::Sopp { imm: 0 }, 0x100b),
+        ] {
+            assert_eq!(
+                window_properties(true, [(name, &fields)].into_iter()),
+                expected
+            );
+            assert_eq!(
+                window_properties(false, [(name, &fields)].into_iter()),
+                0x100b
+            );
         }
     }
 

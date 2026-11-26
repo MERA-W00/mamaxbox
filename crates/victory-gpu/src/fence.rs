@@ -21,6 +21,31 @@ pub(crate) const FENCE_IIDS: [Iid; 4] = [
     PAGEABLE_IIDS[2],
 ];
 
+const FENCE1: Iid = guid(
+    0x433685fe,
+    0xe22b,
+    0x4ca0,
+    [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
+);
+
+/// The fence already implements GetCreationFlags in the Fence1 slot. Creation and
+/// QueryInterface must advertise the same interfaces for that slot to be reachable.
+fn fence_interfaces() -> &'static [Iid] {
+    const EXTENDED: [Iid; 5] = [
+        FENCE_IIDS[0],
+        FENCE_IIDS[1],
+        FENCE_IIDS[2],
+        FENCE_IIDS[3],
+        FENCE1,
+    ];
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_FENCE1").is_some_and(|v| v == "1")) {
+        &EXTENDED
+    } else {
+        &FENCE_IIDS
+    }
+}
+
 #[repr(C)]
 struct Fence {
     object: Object,
@@ -37,6 +62,30 @@ fn fence<'a>(this: This) -> &'a Fence {
     unsafe { &*this.cast::<Fence>() }
 }
 
+/// A queued wait or signal can outlive the title's last fence reference.
+/// Keep the fence until the command runs or its queue discards it.
+#[cfg(windows)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn retain(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.as_this());
+    }
+}
+
 pub(crate) extern "system" fn create(
     _: This,
     initial: u64,
@@ -51,7 +100,7 @@ pub(crate) extern "system" fn create(
         flags,
         waiters: Mutex::new(Vec::new()),
     });
-    object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
+    object::hand_out(FENCE, fence, iid, fence_interfaces(), out)
 }
 
 fn set_event(event: usize) {
@@ -68,7 +117,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     object::answer(
         FENCE,
         iid,
-        object::is(iid, &FENCE_IIDS).then_some(this),
+        object::is(iid, fence_interfaces()).then_some(this),
         out,
     )
 }
@@ -88,6 +137,36 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        #[cfg(windows)]
+        if crate::queue::async_present() {
+            // The signal may still be queued behind next frame's preparation.
+            // Wait on the same publication as a title-supplied event. The
+            // relay publishes it after readbacks and bottom-of-pipe writes.
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+            let _wait = crate::frame_wait::time(crate::frame_wait::Call::FenceLanding);
+            // SAFETY: private auto-reset event, closed after deregistration.
+            let ready = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if ready.is_null() {
+                return windows_sys::Win32::Foundation::E_OUTOFMEMORY;
+            }
+            waiters.push((value, ready as usize));
+            drop(waiters);
+            let result = loop {
+                // A bottom-of-pipe write can also update the mapped fence
+                // word directly, without going through set().
+                match unsafe { WaitForSingleObject(ready, 4) } {
+                    WAIT_OBJECT_0 => break S_OK,
+                    WAIT_TIMEOUT if fence.value.load(Ordering::Acquire) < value => continue,
+                    WAIT_TIMEOUT => break S_OK,
+                    _ => break windows_sys::Win32::Foundation::E_FAIL,
+                }
+            };
+            fence.waiters.lock().unwrap_or_else(|e| e.into_inner())
+                .retain(|&(_, handle)| handle != ready as usize);
+            unsafe { CloseHandle(ready) };
+            return result;
+        }
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
@@ -155,6 +234,47 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fence1_interface_is_created_and_queried() {
+        const FENCE1_IID: Iid = guid(
+            0x433685fe,
+            0xe22b,
+            0x4ca0,
+            [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
+        );
+        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Flags = extern "system" fn(This) -> u32;
+        type Release = extern "system" fn(This) -> u32;
+
+        // Direct creation as ID3D12Fence1, and GetCreationFlags at slot 0x58.
+        let mut f1 = std::ptr::null();
+        if !fence_interfaces().contains(&FENCE1) {
+            assert_eq!(
+                create(std::ptr::null(), 3, 0x5, &FENCE1_IID, &mut f1),
+                crate::object::E_NOINTERFACE
+            );
+            assert!(f1.is_null());
+            return;
+        }
+        assert_eq!(create(std::ptr::null(), 3, 0x5, &FENCE1_IID, &mut f1), S_OK);
+        assert!(!f1.is_null());
+        assert_eq!(slot::<Flags>(f1, 0x58)(f1), 0x5);
+        assert_eq!(slot::<Release>(f1, 0x10)(f1), 0);
+
+        // QueryInterface from ID3D12Fence to ID3D12Fence1 returns the same object.
+        let mut f = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), 0, 0x2, &FENCE_IIDS[0], &mut f),
+            S_OK
+        );
+        let mut queried = std::ptr::null();
+        assert_eq!(slot::<Query>(f, 0x00)(f, &FENCE1_IID, &mut queried), S_OK);
+        assert_eq!(queried, f);
+        assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
+        assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
+        assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
     use super::*;
     use crate::object::slot;
 
@@ -181,7 +301,9 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        if !crate::queue::async_present() {
+            assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        }
         // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.

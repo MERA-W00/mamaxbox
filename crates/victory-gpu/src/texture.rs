@@ -16,7 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -82,11 +82,30 @@ struct Spare(ID3D12Resource, usize);
 // spare.
 unsafe impl Send for Spare {}
 
-/// Spare staging buffers by size (a power of two), and their bytes in all.
-static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
-    Mutex::new((std::collections::BTreeMap::new(), 0));
-/// The most bytes kept spare, and the largest buffer that is pooled.
-const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
+/// Without an override, keep the fork's 256 MiB pool of power-of-two
+/// classes through 8 MiB. VICTORY_STAGING_POOL_MB opts into quarter-octave
+/// classes up to its byte budget. Either switch can disable reuse.
+static STAGING_POOL_BYTES: LazyLock<Option<u64>> = LazyLock::new(|| {
+    if std::env::var_os("VICTORY_STAGING_POOL").is_some_and(|v| v == "0") {
+        return Some(0);
+    }
+    std::env::var("VICTORY_STAGING_POOL_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|mb| mb.checked_mul(1 << 20))
+});
+static SPARE: LazyLock<Mutex<kelvaroq_render::upload_pool::Pool<Spare>>> =
+    LazyLock::new(|| Mutex::new(kelvaroq_render::upload_pool::Pool::new(STAGING_POOL_BYTES.unwrap_or(256 << 20))));
+
+fn staging_class(total: u64, budget: Option<u64>) -> Option<u64> {
+    if let Some(limit) = budget {
+        let size = kelvaroq_render::upload_pool::class(total);
+        (size <= limit).then_some(size)
+    } else {
+        let size = total.max(64 << 10).checked_next_power_of_two()?;
+        (size <= 8 << 20).then_some(size)
+    }
+}
+
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -103,19 +122,10 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// zeroed as a new one is (levels not there yet must read as zeros).
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
-        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
-    }
-    let spare = {
-        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = all.0.get_mut(&size).and_then(Vec::pop);
-        if taken.is_some() {
-            all.1 -= size;
-        }
-        taken
+    let Some(size) = staging_class(total, *STAGING_POOL_BYTES) else {
+        return host.staging_upload_buffer(total, total).map(|(buffer, data)| (buffer, data, 0));
     };
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size);
     if let Some(Spare(buffer, data)) = spare {
         SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the buffer's own mapping, `size` bytes, which nothing
@@ -124,7 +134,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         return Some((buffer, data as *mut u8, size));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+    host.staging_upload_buffer(size, total).map(|(buffer, data)| (buffer, data, size))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -135,6 +145,21 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    published: bool,
+    deferred: bool,
+}
+
+impl Last {
+    /// On contention, keep an already populated staging image once. A first
+    /// upload or a second miss waits for a complete mapping generation.
+    fn defer_remap(&mut self) -> bool {
+        if !self.published || self.deferred {
+            return false;
+        }
+        self.deferred = true;
+        self.asked = 0;
+        true
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -280,7 +305,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+    let before = list.transition(source, COPY_SOURCE).map(|(copy, before)| {
+        let texture = &copy.texture;
         let state = crate::host::legal_state(texture, COPY_SOURCE);
         let barrier = crate::host::transition(
             texture,
@@ -349,37 +375,17 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
-/// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
-///
-/// A texture whose memory is all mapped is read in place, under a lock
-/// the runtime takes alone while it changes a mapping
-/// (`crate::watch::title_memory_reading`), so that no page goes away under
-/// the read. While the world streams in the runtime remaps all the time,
-/// and each of the frame's 150-360 refreshes waited for it: runs 99-101
-/// have 4, 15 and 16 frame lines with over 300 ms of "textures", up to
-/// 3,708 ms, and on every one of them the wait for this lock is the whole
-/// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
-/// ms, the texture's own lock 0).
-///
-/// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
-///
-/// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// VICTORY_TEXTURE_NO_WAIT=1 (default) allows one contested refresh to
+/// retain the previously published image. A successful ReadProcessMemory
+/// can still span two mapping generations, so publishing such a snapshot
+/// would mix texels. With 0, take the mapping read lock on every refresh.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
-/// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Contended refreshes that waited and those served by a previous image.
+pub(crate) static REMAP_CONFLICTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -448,6 +454,254 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
     })
 }
 
+/// `VICTORY_SHORT_REMAP_LOCK=0` conserve le verrou du fork pendant le
+/// hachage et le détuilage. Le défaut (1) libère les remappages dès la
+/// copie, comme dans le banc de contention sur une texture synthétique.
+fn short_remap_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHORT_REMAP_LOCK").is_none_or(|v| v != "0"))
+}
+
+fn refresh_reading(start: usize, end: usize, last: &mut Last, all: bool) -> Option<crate::watch::Reading> {
+    let acquire = |wait| {
+        if all {
+            if wait { Some(crate::watch::title_memory_reading()) } else { crate::watch::title_memory_reading_now() }
+        } else {
+            crate::watch::texture_reading(start, end, wait)
+        }
+    };
+    if no_wait() {
+        if let Some(guard) = acquire(false) {
+            return Some(guard);
+        }
+        if last.defer_remap() {
+            REMAP_CONFLICTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        REMAP_CONFLICTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    waited(2, || acquire(true))
+}
+
+type WriteSample = (u64, Vec<(usize, u64)>);
+
+/// Keep one view of the bytes from the authoritative watch sample through
+/// the mip checks. Only arming physical aliases needs all guest addresses.
+fn texture_write_sample(start: usize, end: usize, last: &mut Last, reading: &mut Option<crate::watch::Reading>) -> Result<Option<WriteSample>, ()> {
+    if reading.is_none() {
+        return Ok(waited(1, || crate::watch::writes(start, end, true)));
+    }
+    if let Some(sample) = waited(1, || crate::watch::texture_writes_without_arming(start, end)) {
+        return Ok(Some(sample));
+    }
+    // Never acquire ALL while holding the texture: a pending writer may
+    // already be waiting for it. Take a fresh authoritative sample under
+    // ALL, then narrow atomically; there is no gap after that sample.
+    drop(reading.take());
+    let mut all = refresh_reading(start, end, last, true).ok_or(())?;
+    let sample = waited(1, || crate::watch::writes(start, end, true));
+    all.restrict_to_texture(start, end);
+    *reading = Some(all);
+    Ok(sample)
+}
+
+fn with_title_snapshot<R>(
+    memory: *const u8,
+    size: usize,
+    mapping: impl Into<Option<crate::watch::Reading>>,
+    release_early: bool,
+    consume: impl FnOnce(&[u8]) -> R,
+) -> R {
+    let mapping = mapping.into();
+    if !release_early {
+        let result = with_title(memory, size, consume);
+        drop(mapping);
+        return result;
+    }
+    with_title(memory, size, |copied| {
+        drop(mapping);
+        consume(copied)
+    })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::with_title_snapshot;
+    use crate::watch::{title_memory_reading, title_memory_remapping};
+
+    #[test]
+    #[ignore = "run with VICTORY_TEXTURE_SCOPED_REMAP=1 and the default enabled texture and alias guards"]
+    fn refresh_of_an_armed_texture_advances_while_another_view_is_remapped() {
+        use crate::watch::tests::{drop_views, two_views};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+
+        assert!(crate::watch::scoped_remap() && super::no_wait());
+        const SIZE: usize = 65536;
+        let (section, source, alias) = two_views(SIZE);
+        let mut last = super::Last::default();
+        let mut guard = super::refresh_reading(source, source + SIZE, &mut last, false);
+        let (initial, _) = super::texture_write_sample(source, source + SIZE, &mut last, &mut guard).unwrap().unwrap();
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: VirtualQuery only inspects our test's second view.
+        assert_ne!(unsafe { VirtualQuery(alias as _, &mut info, size_of_val(&info)) }, 0);
+        assert_eq!(info.Protect, PAGE_READONLY, "the alias was actually armed");
+        last.published = true;
+        let progressed = std::thread::scope(|threads| {
+            let (send, entered) = mpsc::channel();
+            let (release, done) = mpsc::channel();
+            threads.spawn(move || {
+                let _changing = crate::watch::title_memory_remapping_in(|| Some(alias..alias + SIZE));
+                let _ = send.send(());
+                let _ = done.recv_timeout(Duration::from_secs(5));
+            });
+            let entered = entered.recv_timeout(Duration::from_secs(2)).is_ok();
+            let mut read = false;
+            if entered {
+                // The first sample narrowed ALL to the source. A new refresh
+                // takes the same local fast path even with alias guarding on.
+                drop(guard.take());
+                guard = super::refresh_reading(source, source + SIZE, &mut last, false);
+                if guard.is_some() && matches!(super::texture_write_sample(source, source + SIZE, &mut last, &mut guard), Ok(Some(_))) {
+                    super::with_title_snapshot(source as _, SIZE, guard.take(), false, |bytes| {
+                        read = bytes.iter().all(|b| *b == 0);
+                    });
+                }
+            }
+            drop(guard.take());
+            let _ = release.send(());
+            entered && read
+        });
+        assert!(progressed, "a disjoint remap blocked the texture snapshot");
+        // SAFETY: this is the title's ordinary write through our live alias;
+        // the write guard handles it and the source must see it on refresh.
+        unsafe { (alias as *mut u8).write_volatile(7) };
+        let mut guard = super::refresh_reading(source, source + SIZE, &mut last, false);
+        let (_, changed) = super::texture_write_sample(source, source + SIZE, &mut last, &mut guard).unwrap().unwrap();
+        assert!(changed.iter().any(|&(_, when)| when > initial));
+        super::with_title_snapshot(source as _, SIZE, guard, false, |bytes| assert_eq!(bytes[0], 7));
+        drop_views(section, &[source, alias], SIZE);
+    }
+
+    #[test]
+    fn conflicting_refresh_retains_only_a_published_image_and_retries_once() {
+        let mut last = super::Last::default();
+        assert!(!last.defer_remap(), "first publication must wait");
+        last.published = true;
+        last.asked = 42;
+        assert!(last.defer_remap());
+        assert_eq!(last.asked, 0, "the next write-watch check must retry");
+        assert!(!last.defer_remap(), "a continuous remap cannot starve this texture");
+    }
+
+    #[test]
+    fn snapshot_preserves_the_bytes_and_selected_remap_lock_lifetime() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows_sys::Win32::System::Memory::*;
+
+        const PAGE: usize = 4096;
+        for (sparse, release_early) in [(false, false), (false, true), (true, false), (true, true)] {
+            // SAFETY: this test owns the entire allocation. Only the writer
+            // remaps it, and only while holding the remapping guard.
+            unsafe {
+                let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+                assert!(!base.is_null());
+                base.write_bytes(0x31, 3 * PAGE);
+                if sparse {
+                    assert_ne!(VirtualFree(base.add(PAGE).cast(), PAGE, MEM_DECOMMIT), 0);
+                }
+                let mut original = vec![0x31; 3 * PAGE];
+                if sparse { original[PAGE..2 * PAGE].fill(0); }
+                let address = base as usize;
+                std::thread::scope(|scope| {
+                    let (begin, wait) = mpsc::channel();
+                    let (attempt, started) = mpsc::channel();
+                    let (finished, remapped) = mpsc::channel();
+                    scope.spawn(move || {
+                        wait.recv().unwrap();
+                        attempt.send(()).unwrap();
+                        let _changing = crate::watch::title_memory_remapping_in(|| Some(address..address + 3 * PAGE));
+                        let first = address as *mut u8;
+                        assert_ne!(VirtualFree(first.cast(), PAGE, MEM_DECOMMIT), 0);
+                        assert_eq!(VirtualAlloc(first.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), first.cast());
+                        first.write_bytes(0xa7, PAGE);
+                        if sparse {
+                            let middle = first.add(PAGE);
+                            assert_eq!(VirtualAlloc(middle.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+                            middle.write_bytes(0xa7, PAGE);
+                        }
+                        let _ = finished.send(());
+                    });
+                    let guard = crate::watch::texture_reading(address, address + 3 * PAGE, true).unwrap();
+                    with_title_snapshot(base, 3 * PAGE, guard, release_early, |copied| {
+                        begin.send(()).unwrap();
+                        started.recv().unwrap();
+                        if release_early {
+                            remapped.recv_timeout(Duration::from_secs(5)).expect("writer blocked by the snapshot consumer");
+                        } else {
+                            assert_eq!(remapped.try_recv(), Err(mpsc::TryRecvError::Empty));
+                            assert_eq!(super::committed(base.add(PAGE), PAGE), !sparse);
+                        }
+                        assert_eq!(copied, original);
+                    });
+                });
+                original[..PAGE].fill(0xa7);
+                if sparse { original[PAGE..2 * PAGE].fill(0xa7); }
+                let guard = crate::watch::texture_reading(address, address + 3 * PAGE, true).unwrap();
+                with_title_snapshot(base, 3 * PAGE, guard, release_early, |fresh| assert_eq!(fresh, original));
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timed contention on a copied synthetic texture"]
+    fn benchmark_remapping_during_hash_and_detile() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let (width, height) = (2048usize, 1024usize);
+        let words = [3u32, 0, 0, 0, width as u32, 0, height as u32, 65537, 10, 1, 0, 256, 3_145_728, 0];
+        // SAFETY: the resource description contains only the fourteen numeric words given.
+        let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        let source: Vec<u8> = (0..layout.size as usize).map(|i| (i.wrapping_mul(7) ^ (i >> 11)) as u8).collect();
+        let pitch = width * 8;
+        let mut linear = vec![0; pitch * height];
+        let mut expected = None;
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..9 {
+            for index in [round % 2, 1 - round % 2] {
+                let guard = title_memory_reading();
+                let wait = std::thread::scope(|scope| {
+                    let (started, ready) = mpsc::sync_channel(0);
+                    let writer = scope.spawn(move || {
+                        started.send(()).unwrap();
+                        let instant = Instant::now();
+                        drop(title_memory_remapping());
+                        instant.elapsed()
+                    });
+                    ready.recv().unwrap();
+                    let mut consume = |copied: &[u8]| {
+                        std::hint::black_box(blake3::hash(copied));
+                        layout.detile(copied, 0, 0, &mut linear, pitch, pitch * height).unwrap();
+                    };
+                    with_title_snapshot(source.as_ptr(), source.len(), guard, index != 0, &mut consume);
+                    writer.join().unwrap()
+                });
+                let hash = blake3::hash(&linear);
+                assert_eq!(hash, *expected.get_or_insert(hash));
+                if round != 0 { times[index].push(wait.as_micros()); }
+            }
+        }
+        for series in &mut times { series.sort_unstable(); }
+        println!("{} bytes, waiting writer: before {} us, after {} us", source.len(),
+                 (times[0][3] + times[0][4]) / 2, (times[1][3] + times[1][4]) / 2);
+    }
+}
+
 /// Staging buffers alive (also those only a list still holds) and their
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -460,11 +714,9 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
-            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
-                all.1 += self.pooled;
-                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
-            }
+            let spare = Spare(self.buffer.clone(), self.data as usize);
+            let excess = SPARE.lock().unwrap_or_else(|e| e.into_inner()).give(self.pooled, spare);
+            drop(excess);
         }
     }
 }
@@ -962,17 +1214,8 @@ impl Staging {
 
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
-    }
-
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    pub(crate) fn refresh(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -982,19 +1225,26 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        let Some(end) = start.checked_add(size) else { return 0 };
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let scoped = crate::watch::scoped_remap();
+        let mut early = if scoped {
+            let Some(guard) = refresh_reading(start, end, last, false) else { return 0 };
+            Some(guard)
+        } else {
+            None
+        };
+        let release_early = short_remap_lock() && !self.on_demand;
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
+            if scoped { last.deferred = false; }
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
-            });
+            with_title_snapshot(self.memory, size, early, release_early, |read| self.publish(read, last));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
@@ -1010,9 +1260,12 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
-        {
+        let guarded = if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0")) {
+            let Ok(sample) = texture_write_sample(start, end, last, &mut early) else { return 0 };
+            sample
+        } else { None };
+        if let Some((now, written)) = guarded {
+            if scoped { last.deferred = false; }
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
@@ -1027,17 +1280,11 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
-        };
+        let Some(mapped) = early.or_else(|| refresh_reading(start, end, last, false)) else { return 0 };
+        last.deferred = false;
+        // A sparse texture also queries which mips are resident while it
+        // detiles. Keep its bytes and that residency decision in one view
+        // of the mapping. Dense textures can release the lock after copying.
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1053,8 +1300,7 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let changed = with_title_snapshot(self.memory, size, mapped, release_early, |read| {
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1063,7 +1309,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.publish(read, last);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1073,8 +1319,8 @@ impl Staging {
             let _ = changed;
             return size;
         }
-        if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+        if scoped || through_copy() || crate::remap::overlaps(start, size) {
+            return with_title_snapshot(self.memory, size, mapped, release_early, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1082,14 +1328,14 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(tiled);
+                self.publish(tiled, last);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held, including through detiling.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -1098,43 +1344,22 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.publish(tiled, last);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 
-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
-            }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
-            }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
+    /// Detiles `tiled` (the texture's memory) into the staging buffer.
+    fn publish(&self, tiled: &[u8], last: &mut Last) {
+        last.published = self.detile(tiled);
+        if !last.published {
             last.asked = 0;
-            0
+            last.hash = None;
         }
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8]) -> bool {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1177,9 +1402,10 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
             }
         }
+        held != 0
     }
 }
 
@@ -1250,20 +1476,32 @@ pub(crate) fn is_staged(resource: This) -> bool {
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
-/// The bytes of a title texture's memory, and whether all of it is mapped,
-/// if the texture has been staged for upload.
-pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
+/// Staged source bytes and the next frame the heap slot needs checking.
+pub(crate) fn staged_revisit(resource: This, frame: u64, partial: Option<u64>) -> (u64, Option<(u64, u64)>) {
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()?.get(&(resource as usize))?.clone()
+        map.as_ref().and_then(|map| map.get(&(resource as usize))).cloned()
     };
-    let size = s.layout.size as usize;
-    Some((size as u64, committed(s.memory, size)))
+    let size = s.as_ref().map_or(0, |s| s.layout.size as usize);
+    let fully_mapped = || s.is_none_or(|s| committed(s.memory, size));
+    let again = if batched_residency() {
+        kelvaroq_render::residency::heap_texture_revisit(frame, partial, fully_mapped)
+    } else {
+        let whole = fully_mapped();
+        partial.map(|bytes| (frame + 1, bytes)).or_else(|| (!whole).then_some((frame + 120, 0)))
+    };
+    (size as u64, again)
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    crate::remap::pieces(at as usize, len, |_, host, n, translated| {
+        translated || native_committed(host as _, n)
+    }).unwrap_or_else(|| native_committed(at, len))
+}
+
+fn native_committed(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }
@@ -1297,8 +1535,7 @@ fn by_query() -> bool {
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
@@ -1311,20 +1548,9 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         for (i, entry) in info[..n].iter_mut().enumerate() {
             entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
         }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-            )
-        } != 0;
+        let asked = query_pages(&mut info[..n]);
         for (i, entry) in info[..n].iter().enumerate() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            if sample_readable(entry, asked, (page + i) * KERNEL_PAGE) {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -1333,6 +1559,43 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+type WorkingPage = windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
+
+fn query_pages(entries: &mut [WorkingPage]) -> bool {
+    use windows_sys::Win32::System::{ProcessStatus::K32QueryWorkingSetEx, Threading::GetCurrentProcess};
+    // SAFETY: the initialized entries belong to this process and the slice
+    // stays live through the query. Callers pass at most 256 entries.
+    unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), entries.as_mut_ptr().cast(), size_of_val(entries) as u32) != 0 }
+}
+
+fn sample_readable(entry: &WorkingPage, asked: bool, address: usize) -> bool {
+    // SAFETY: the first bit marks a valid working-set entry after a successful query.
+    let resident = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+    resident || crate::host::read_into(address as *const u8, &mut [0])
+}
+
+fn probe_blocks(addresses: &[usize], present: &mut [bool]) {
+    // SAFETY: zero is a valid initial value for working-set query entries.
+    let mut info: [WorkingPage; kelvaroq_render::residency::MAX_BATCH] = unsafe { std::mem::zeroed() };
+    let entries = &mut info[..addresses.len()];
+    for (entry, &address) in entries.iter_mut().zip(addresses) {
+        entry.VirtualAddress = address as *mut _;
+    }
+    let asked = query_pages(entries);
+    for ((value, entry), &address) in present.iter_mut().zip(entries).zip(addresses) {
+        *value = sample_readable(entry, asked, address);
+    }
+}
+
+/// `VICTORY_BATCHED_RESIDENCY=0` reprend les sondes bloc par bloc du fork
+/// et vérifie toute la texture même si son placement partiel est connu.
+/// Le défaut (1) conserve la mesure Kelvaroq de 6,57 µs pour 256 blocs
+/// présents, contre 104,3 µs avec les appels individuels.
+fn batched_residency() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCHED_RESIDENCY").is_none_or(|v| v != "0"))
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -1359,22 +1622,27 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
+    let mut bytes = 0;
+    if crate::remap::pieces(at as usize, len, |_, host, n, translated| {
+        bytes += if translated { n as u64 } else { native_mapped_bytes(host as _, n) };
+        true
+    }).is_some() { return bytes; }
+    native_mapped_bytes(at, len)
+}
+
+fn native_mapped_bytes(at: *const u8, len: usize) -> u64 {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
-    if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
-            // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
-            return (there as u64 * 4096).min(len as u64);
-        }
+    let by_query = by_query();
+    static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_block = !by_query && !*BY_PAGE.get_or_init(|| {
+        std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")
+    });
+    if by_block && batched_residency() {
         // By 64 KiB block, one page asked of each: the title's memory is
         // mapped in blocks of that size (the console's page), and the
         // answer is a measure of how much of a texture has arrived, not a
@@ -1383,17 +1651,28 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+        return kelvaroq_render::residency::heap_mapped_bytes(start, len, probe_blocks);
+    }
+    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+        return 0;
+    }
+    if by_block {
         const BLOCK: usize = 64 << 10;
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
         while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+            let lo = block.max(start);
+            let hi = block.saturating_add(BLOCK).min(end);
             if readable(lo, 1, true).0 == 1 {
                 there += (hi - lo) as u64;
             }
-            block = block.saturating_add(BLOCK);
+            block = hi;
         }
         return there;
+    }
+    if !by_query {
+        let (there, _) = readable(start, len, false);
+        return (there as u64 * 4096).min(len as u64);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1499,6 +1778,174 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 mod title_memory_tests {
     use super::with_title;
 
+    #[test]
+    fn staging_pool_preserves_fork_defaults_and_respects_the_explicit_budget() {
+        let mib = 1 << 20;
+        assert_eq!(super::staging_class(mib + 1, None), Some(2 * mib));
+        assert_eq!(super::staging_class(8 * mib, None), Some(8 * mib));
+        assert_eq!(super::staging_class(8 * mib + 1, None), None);
+        assert_eq!(super::staging_class(mib + 1, Some(2 * mib)), Some(mib + mib / 4));
+        assert_eq!(super::staging_class(mib + 1, Some(mib)), None);
+        assert_eq!(super::staging_class(1, Some(0)), None);
+    }
+
+    const BLOCK_BYTES: usize = 64 * 1024;
+
+    struct SampleMemory(*mut u8);
+
+    impl SampleMemory {
+        fn new(blocks: usize, holes: bool) -> Self {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+            // SAFETY: we reserve our own range, commit only within it, then touch
+            // those blocks to put their sampled pages into the working set.
+            unsafe {
+                let memory = Self(VirtualAlloc(std::ptr::null(), blocks * BLOCK_BYTES, MEM_RESERVE, PAGE_READWRITE).cast());
+                assert!(!memory.0.is_null());
+                for i in 0..blocks {
+                    if !holes || i % 4 != 2 {
+                        let page = memory.0.add(i * BLOCK_BYTES);
+                        assert_eq!(VirtualAlloc(page.cast(), BLOCK_BYTES, MEM_COMMIT, PAGE_READWRITE), page.cast());
+                        page.write_volatile(1);
+                    }
+                }
+                memory
+            }
+        }
+    }
+
+    impl Drop for SampleMemory {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: this is the base of our private reservation.
+            unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    fn individual_samples(start: usize, len: usize) -> u64 {
+        let end = start + len;
+        ((start & !(BLOCK_BYTES - 1))..end).step_by(BLOCK_BYTES)
+            .filter(|&block| super::readable(block.max(start), 1, true).0 == 1)
+            .map(|block| (end.min(block + BLOCK_BYTES) - start.max(block)) as u64)
+            .sum()
+    }
+
+    #[test]
+    fn batched_texture_residency_matches_holes_and_unaligned_edges() {
+        let memory = SampleMemory::new(263, true);
+        let start = memory.0 as usize + 12_345;
+        let len = 260 * BLOCK_BYTES + 89;
+        let grouped = kelvaroq_render::residency::mapped_block_bytes(start, len, super::probe_blocks);
+        assert_eq!(grouped, (len - 65 * BLOCK_BYTES) as u64);
+        assert_eq!(grouped, individual_samples(start, len));
+        // If the Windows query fails, every requested page still takes the safe read path.
+        let unknown: super::WorkingPage = unsafe { std::mem::zeroed() };
+        assert!(super::sample_readable(&unknown, false, memory.0 as usize));
+        assert!(!super::sample_readable(&unknown, false, memory.0 as usize + 2 * BLOCK_BYTES));
+    }
+
+    fn prior_heap_estimate(start: usize, len: usize) -> u64 {
+        if !super::committed(start as *const u8, 1)
+            && !super::committed((start + len - 1) as *const u8, 1)
+        {
+            return 0;
+        }
+        kelvaroq_render::residency::mapped_block_bytes(start, len, super::probe_blocks)
+    }
+
+    #[test]
+    fn heap_probes_observe_decommit_recommit_and_within_block_holes() {
+        use windows_sys::Win32::System::Memory::*;
+        let memory = SampleMemory::new(3, false);
+        let base = memory.0 as usize;
+        let mut addresses = [(base + 75, BLOCK_BYTES - 79), (base + 75, 2 * BLOCK_BYTES), (base + BLOCK_BYTES + 9, 11)];
+        let check = |ranges: &[(usize, usize)]| {
+            for &(start, len) in ranges {
+                assert_eq!(kelvaroq_render::residency::heap_mapped_bytes(start, len, super::probe_blocks),
+                           prior_heap_estimate(start, len));
+            }
+        };
+        check(&addresses);
+        // SAFETY: these pages belong to the test reservation throughout.
+        unsafe {
+            assert_ne!(VirtualFree(memory.0.cast(), 4096, MEM_DECOMMIT), 0);
+            check(&addresses); // a missing first page and a present tail in one block
+            assert_ne!(VirtualFree(memory.0.add(BLOCK_BYTES).cast(), BLOCK_BYTES, MEM_DECOMMIT), 0);
+            check(&addresses);
+            assert_eq!(VirtualAlloc(memory.0.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), memory.0.cast());
+            check(&addresses);
+        }
+        addresses[0] = (base, 4097);
+        check(&addresses);
+    }
+
+    #[test]
+    #[ignore = "timed Windows heap-slot preparation"]
+    fn benchmark_heap_slot_probes() {
+        use kelvaroq_render::residency::{heap_mapped_bytes, heap_texture_revisit};
+        use std::{hint::black_box, time::Instant};
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        for (blocks, missing) in [(1, None), (64, None), (64, Some(2)), (64, Some(61))] {
+            let memory = SampleMemory::new(blocks, false);
+            let (start, len) = (memory.0 as usize, blocks * BLOCK_BYTES);
+            if let Some(hole) = missing {
+                // SAFETY: inside this test reservation.
+                assert_ne!(unsafe { VirtualFree(memory.0.add(hole * BLOCK_BYTES).cast(), BLOCK_BYTES, MEM_DECOMMIT) }, 0);
+            }
+            let run = |new: bool| {
+                let mapped = if new { heap_mapped_bytes(start, len, super::probe_blocks) } else { prior_heap_estimate(start, len) };
+                let partial = (mapped < len as u64).then_some(mapped);
+                let again = if new {
+                    heap_texture_revisit(4, partial, || super::committed(memory.0, len))
+                } else {
+                    let whole = super::committed(memory.0, len);
+                    partial.map(|n| (5, n)).or_else(|| (!whole).then_some((124, 0)))
+                };
+                (mapped, again)
+            };
+            assert_eq!(run(false), run(true));
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..9 {
+                for variant in [round % 2, 1 - round % 2] {
+                    let clock = Instant::now();
+                    for _ in 0..200 { black_box(run(variant != 0)); }
+                    samples[variant].push(clock.elapsed().as_nanos() / 200);
+                }
+            }
+            for sample in &mut samples { sample.sort_unstable(); }
+            println!("blocks={blocks} missing={missing:?} previous={} ns updated={} ns", samples[0][4], samples[1][4]);
+        }
+    }
+
+    #[test]
+    #[ignore = "timed Windows working-set calls"]
+    fn benchmark_texture_residency() {
+        for holes in [false, true] {
+            let memory = SampleMemory::new(512, holes);
+            let start = memory.0 as usize;
+            for blocks in [1, 16, 256, 512] {
+                let len = blocks * BLOCK_BYTES;
+                let mut times = [Vec::new(), Vec::new()];
+                let expected = individual_samples(start, len);
+                for round in 0..8 {
+                    for index in [round % 2, 1 - round % 2] {
+                        let iterations = (8192 / blocks).min(1000);
+                        let timer = std::time::Instant::now();
+                        for _ in 0..iterations {
+                            let bytes = if index == 0 { individual_samples(start, len) } else {
+                                kelvaroq_render::residency::mapped_block_bytes(start, len, super::probe_blocks)
+                            };
+                            assert_eq!(std::hint::black_box(bytes), expected);
+                        }
+                        times[index].push(timer.elapsed().as_nanos() / iterations as u128);
+                    }
+                }
+                for results in &mut times { results.sort_unstable(); }
+                println!("blocks={blocks} holes={holes} individual={} ns grouped={} ns",
+                         (times[0][3] + times[0][4]) / 2, (times[1][3] + times[1][4]) / 2);
+            }
+        }
+    }
+
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
     /// memory a page of which is taken away between two reads, and the
@@ -1602,6 +2049,92 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+/// What making a texture's host copy and its staging buffer costs on the
+/// host card, zeroed by the system or not, and with the staging buffer
+/// taken from the pool: a measurement (ignored by default), run with
+/// `cargo test -p victory-gpu --release --lib texture::creation_bench -- --ignored --nocapture`.
+#[cfg(test)]
+mod creation_bench {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    const COUNT: usize = 48;
+
+    fn texture_desc(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, size: u64) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: size,
+            Height: size as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 0,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark; see the module notes"]
+    fn bench_creation() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU");
+            return;
+        };
+        let device = &host.device;
+        for (name, format, size) in [("BC7 2048", DXGI_FORMAT_BC7_UNORM, 2048u64), ("RGBA8 2048", DXGI_FORMAT_R8G8B8A8_UNORM, 2048)] {
+            let desc = texture_desc(format, size);
+            let mut total = 0u64;
+            // SAFETY: plain queries and creations with valid descriptions.
+            unsafe { device.GetCopyableFootprints(&desc, 0, 12, 0, None, None, None, Some(&mut total)) };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            for flags in [D3D12_HEAP_FLAG_NONE, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED] {
+                let mut kept = Vec::new();
+                let started = std::time::Instant::now();
+                for _ in 0..COUNT {
+                    let mut t: Option<ID3D12Resource> = None;
+                    unsafe {
+                        device
+                            .CreateCommittedResource(&heap, flags, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut t)
+                            .unwrap()
+                    };
+                    kept.push(t.unwrap());
+                }
+                let us = started.elapsed().as_micros() as f64 / COUNT as f64;
+                println!("{name}: host texture {:>9.1} us each ({})", us, if flags == D3D12_HEAP_FLAG_NONE { "zeroed" } else { "not zeroed" });
+            }
+            // A staging buffer made, mapped and written whole (as a detile
+            // writes it), each way.
+            let fill = |data: *mut u8| unsafe { std::ptr::write_bytes(data, 0x5a, total as usize) };
+            for unzeroed in [false, true] {
+                let mut kept = Vec::new();
+                let started = std::time::Instant::now();
+                for _ in 0..COUNT {
+                    let (b, d) = if unzeroed { host.staging_upload_buffer(total, total) } else { host.upload_buffer(total) }.unwrap();
+                    fill(d);
+                    kept.push(b);
+                }
+                let us = started.elapsed().as_micros() as f64 / COUNT as f64;
+                println!("{name}: staging {:.1} MB made and written {:>9.1} us each ({})", total as f64 / 1e6, us, if unzeroed { "staging policy (VICTORY_NOT_ZEROED)" } else { "default allocation" });
+            }
+            // From the pool: made once, then taken and written.
+            let mut pool = kelvaroq_render::upload_pool::Pool::new(u64::MAX);
+            let capacity = kelvaroq_render::upload_pool::class(total);
+            for _ in 0..COUNT {
+                let (b, d) = host.staging_upload_buffer(capacity, total).unwrap();
+                assert!(pool.give(capacity, Spare(b, d as usize)).is_none());
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..COUNT {
+                let Spare(b, d) = pool.take(total).unwrap();
+                fill(d as *mut u8);
+                drop(b);
+            }
+            let us = started.elapsed().as_micros() as f64 / COUNT as f64;
+            println!("{name}: staging taken from the pool and written {us:>9.1} us each");
         }
     }
 }

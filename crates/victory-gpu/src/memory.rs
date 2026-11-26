@@ -11,8 +11,8 @@
 //!
 //! - the **directory**: per 64 KiB page of title address space the number
 //!   of the copy that holds the page (0: none) and the page's byte offset
-//!   in it; one buffer for all lists, entries only ever go from empty to
-//!   filled;
+//!   in it. Pool mode also updates entries after a view remap, once the
+//!   previous submission has finished reading the directory.
 //! - per view heap a run of slots with a raw unordered access view of each
 //!   numbered copy (slot 0 of the run: a null view, for pages without a
 //!   copy);
@@ -44,6 +44,8 @@
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
+pub(crate) mod pool;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +65,7 @@ const CELL: u64 = 4 << 20;
 const PAGE: u64 = 1 << 16;
 
 struct Memory {
+    sections: pool::Sections,
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
@@ -105,6 +108,7 @@ impl Memory {
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
+            sections: Default::default(),
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
@@ -169,7 +173,7 @@ impl Memory {
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(directory_offset(&shadow, first, at) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -185,7 +189,7 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        let offset = directory_offset(&shadow, shadow.span().0, start);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
@@ -231,6 +235,12 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+}
+
+/// A private buffer can start between page boundaries. The raw UAV starts
+/// at the host buffer's first byte, so each directory entry includes that gap.
+fn directory_offset(shadow: &Shadow, first: u64, at: u64) -> u64 {
+    if shadow.direct_read() { shadow.offset(at) } else { at - first }
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -280,16 +290,28 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = if crate::inplace::pool::raw_reads() {
+                m.sections.reserve(heap, key)?
+            } else {
+                heap.dynamic(COPIES + 1)?
+            };
             heap.null_raw_uav_at(base);
             (base, 0)
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        let (first, len) = shadow.span();
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len + directory_offset(shadow, first, first));
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
+    let pool = crate::inplace::pool::raw_reads();
+    if pool {
+        if !writes && let Some(_reading) = crate::watch::title_memory_reading_now() {
+            m.sections.scan(&host()?.device, &m.copies, true);
+        }
+        let bound = m.sections.bind(heap, key, base);
+        list.raw_pool_bound(if writes { 0 } else { bound });
+    }
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -301,7 +323,11 @@ pub(crate) fn ready(
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
+            if pool && !shadow.direct_read() {
+                list.defer_pool_read(shadow, start as usize, len as usize);
+            } else {
+                shadow.refresh(list, start, len);
+            }
         }
         if writes && (first_write || n >= numbered) {
             shadow.gpu_writes(list, start, len);

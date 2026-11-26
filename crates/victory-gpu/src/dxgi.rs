@@ -3,6 +3,9 @@
 //! (IUnknown, the object methods, then each interface's methods).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+pub(crate) mod planes;
+
 use crate::object::{
     self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, MORE_DATA, NOT_FOUND, OUTPUT,
     Object, S_OK, Table, This, guid,

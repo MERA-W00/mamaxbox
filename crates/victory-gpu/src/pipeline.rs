@@ -378,6 +378,18 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let frame = crate::frame::current();
+    #[cfg(windows)]
+    if kelvaroq_render::pacing::workload_enabled()
+        && let Some(mesh) = p.shaders.iter().find(|s| s.stage == "mesh")
+        && let Some(pixel) = p.shaders.iter().find(|s| s.stage == "pixel")
+    {
+        kelvaroq_render::pacing::workload_bind(
+            crate::queue::presented(),
+            frame,
+            &mesh.hash,
+            &pixel.hash,
+        );
+    }
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
@@ -388,10 +400,30 @@ pub(crate) fn bound(this: This) {
 /// use starts that, see [`make`]).
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
+    if this.is_null() || no_draws() {
         return None;
     }
+    let _call = crate::title_hold::begin();
     make::ready(&pipeline(this).host)
+}
+
+/// `VICTORY_NO_DRAWS=1`: no host pipeline is made and no shader is
+/// translated; every draw and dispatch of the title is dropped. The title
+/// runs as before (its code, streaming, memory) and the picture stays
+/// black: the frame time then is the title's own code and our system
+/// services, the ceiling no graphics work can raise. After the switch of
+/// the same name in Cold Project VI (GPL-3.0), which measured 42-53 ms a
+/// frame that way.
+#[cfg(windows)]
+pub(crate) fn no_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_DRAWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_NO_DRAWS=1: no pipelines, no shaders, nothing of the title drawn");
+        }
+        on
+    })
 }
 
 /// Host pipelines queued and not made yet.
@@ -467,6 +499,7 @@ pub(crate) fn note_drop(this: This) {
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
+    if crate::monitor::enabled() { crate::monitor::drop_reason(&why); }
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
@@ -503,8 +536,7 @@ fn hand_out(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
-    #[cfg(windows)]
-    make::early(&host);
+    let host = if no_draws() { host } else { make::early(host) };
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -582,6 +614,29 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Slot 0x218 tries a precompiled compute pipeline. The caller looks up
+/// a cache entry by key, fills in its root signature and passes the four
+/// address and length pairs after it. The first pair holds only 28 bytes.
+/// On a miss the caller retries at 0x1f0 with its full shader container.
+pub(crate) extern "system" fn cached_compute(
+    _: This,
+    _desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    if !out.is_null() {
+        // SAFETY: the caller supplies the pipeline out pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+    if misses.is_power_of_two() {
+        tracing::info!(misses, "precompiled compute cache miss at 0x218; the caller can retry with its shader at 0x1f0");
+    }
+    object::E_NOTIMPL
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -709,6 +764,9 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+#[cfg(windows)]
+pub use library::precompile::{outstanding, precompile};
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
@@ -743,6 +801,124 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// Exercises the title's dispatch and indirect dispatch with a small
+    /// pretranslated shader. The clamp installs its own compute signature
+    /// before the indirect dispatch must restore the title's arguments.
+    #[cfg(windows)]
+    #[test]
+    fn repeated_root_bindings_reach_direct_and_indirect_dispatches() {
+        use victory_shader::emit::{HostShader, UserData};
+        use victory_shader::{HwStage, RootType};
+        use windows::core::s;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(device) = crate::host::host() else { return };
+        let cs = r#"
+            cbuffer Args : register(b0, space0) { uint at; uint addend; };
+            RWByteAddressBuffer output : register(u1, space1);
+            [numthreads(1, 1, 1)]
+            void main() { uint before; output.InterlockedAdd(at, addend, before); }
+        "#;
+        let dxil = crate::host::compile(cs, s!("main"), s!("cs_5_1")).expect("compute shader");
+        let host_shader = HostShader {
+            stage: HwStage::Cs, dxil,
+            user_data: (0..2).map(|i| UserData { index: i, slot: 0, root: RootType::Constants, dword: i }).collect(),
+            root_uavs: vec![1], root_cbvs: vec![], root_srvs: vec![],
+            root_indexed_views: vec![], samplers: vec![], static_samplers: vec![],
+        };
+        let shader = Arc::new(Shader {
+            hash: "root binding test".into(), stage: "compute", container: Vec::new(),
+            translated: OnceLock::from(Some(Translated { host: host_shader, used: vec![], stores: true })),
+        });
+        let mut pipe = std::ptr::null();
+        assert_eq!(hand_out(vec![shader], None, &PIPELINE_IIDS[0], &mut pipe), S_OK);
+        assert!(make::now(&pipeline(pipe).host), "translated compute pipeline");
+
+        // The console heap description, then the two zero placement fields.
+        #[repr(C)]
+        struct HeapPacket([u32; 4], [u64; 2]);
+        let packet = HeapPacket([0, 64, 1, 1], [0; 2]);
+        let mut heap = std::ptr::null();
+        assert_eq!(crate::descriptor::create_heap(
+            std::ptr::null(), std::ptr::from_ref(&packet).cast(), &PAGEABLE_IIDS[0], &mut heap,
+        ), S_OK);
+
+        const PAGE: usize = crate::watch::PAGE;
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // Separate registered buffers for UAV output and indirect input.
+        // SAFETY: a fresh, write-watched allocation, held through completion.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        assert!(!mem.is_null());
+        let out = mem as u64;
+        let args = out + PAGE as u64;
+        unsafe { (args as *mut [u32; 3]).write([1, 1, 1]) };
+        for start in [out, args] {
+            crate::shadow::register(start as usize, start, PAGE as u64);
+        }
+
+        let list = device.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipe);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, out);
+        state.set_constants(true, 0, &[0, 7], 0);
+        state.dispatch(&list, 1, 1, 1);
+        state.dispatch(&list, 1, 1, 1);  // same constants and table
+        state.set_constants(true, 0, &[4, 3], 0);
+        state.dispatch(&list, 1, 1, 1);
+        assert!(state.execute_indirect(&list, (2, 12, 1), args, None));
+        state.dispatch(&list, 1, 1, 1);  // after the foreign clamp and indirect call
+        state.set_view(true, 1, out + 64);  // same constants, different host table
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        device.execute(&[&list]);
+
+        // SAFETY: execute waited for the GPU and copied its declared writes back.
+        let words = unsafe { std::slice::from_raw_parts(mem.cast::<u32>(), 18) };
+        let mut expected = [0u32; 18];
+        expected[0] = 14;
+        expected[1] = 9;
+        expected[17] = 3;
+        assert_eq!(words, expected);
+        eprintln!("direct/indirect root-binding readback: {}, {}, {}", words[0], words[1], words[17]);
+        drop(state);
+        drop(list);
+        for start in [out, args] {
+            crate::shadow::unregister(start as usize, start);
+        }
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+        slot::<extern "system" fn(This) -> u32>(pipe, 0x10)(pipe);
+        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+    }
+
+    /// A miss in the precompiled cache leaves the caller free to supply
+    /// its compute shader through the other device method.
+    #[test]
+    fn cached_compute_miss_falls_back_to_the_compute_container() {
+        use crate::object::slot;
+        type Cached = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        type Compute = extern "system" fn(This, *const ComputeHead, u32, *const u8, *const Iid, *mut This) -> HRESULT;
+        let device = crate::device::device();
+        let pair_data = [0u32; 7];
+        let mut entry = [0usize; 9];
+        for pair in entry[1..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&[pair_data.as_ptr() as usize, size_of_val(&pair_data)]);
+        }
+        let mut p = device;
+        assert!(slot::<Cached>(device, 0x218)(device, entry.as_ptr().cast(), &PIPELINE_IIDS[0], &mut p) < 0);
+        assert!(p.is_null());
+        let code = [1u8, 2, 3, 4];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode { code: code.as_ptr(), size: code.len() },
+        };
+        assert_eq!(slot::<Compute>(device, 0x1f0)(device, &desc, 0, std::ptr::null(), &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("compute", code.to_vec())]);
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
     }
 
     #[test]

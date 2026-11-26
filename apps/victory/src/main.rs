@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -112,6 +114,16 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Build the recorded pipelines before starting a title.
+    #[cfg(windows)]
+    Precompile {
+        /// Cache root containing the pipelines and shaders directories.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Print the number of outstanding recipes without building any.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -182,6 +194,8 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        #[cfg(windows)]
+        Command::Precompile { cache, check } => precompile::run(cache, check),
         Command::Config => show_config(),
     }
 }

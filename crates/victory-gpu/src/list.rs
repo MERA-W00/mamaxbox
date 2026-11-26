@@ -12,6 +12,9 @@
 
 use std::mem::offset_of;
 
+#[cfg(windows)]
+mod uav_clear;
+
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
 };
@@ -189,6 +192,9 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(windows)]
 pub(crate) struct Detached {
     host: crate::host::HostList,
+    /// A cut recording can replay the same dynamic tables in later parts.
+    /// Only an uncut list owns both the slots and their last GPU use.
+    pub(crate) whole_recording: bool,
     _uploads: Vec<Vec<u8>>,
     _state: crate::draw::State,
 }
@@ -197,6 +203,12 @@ pub(crate) struct Detached {
 impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
+    }
+
+    /// For WARP lists whose descriptor heap and uploads are owned by the test.
+    #[cfg(test)]
+    pub(crate) fn for_test(host: crate::host::HostList) -> Self {
+        Self { host, whole_recording: true, _uploads: Vec::new(), _state: Default::default() }
     }
 }
 
@@ -266,7 +278,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, Detached { host, _uploads, _state, .. }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
@@ -418,6 +430,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     part.waits,
                     Detached {
                         host: part.host,
+                        whole_recording: false,
                         _uploads: Vec::new(),
                         _state: Default::default(),
                     },
@@ -428,6 +441,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             gate,
             Detached {
                 host,
+                whole_recording: single,
                 _uploads: uploads,
                 _state: state,
             },
@@ -490,6 +504,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             this,
             Detached {
                 host,
+                whole_recording: true,
                 _uploads: uploads,
                 _state: state,
             },
@@ -565,11 +580,7 @@ fn new_list(
     }
     tracing::debug!(kind, "command list");
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
-        },
+        object: Object::new(list_functions(crate::device::newer())),
         kind,
         put: [0; 5],
         reserved: [0; 64],
@@ -693,7 +704,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            let (copy, before) = list.transition(b.first, wanted)?;
+            let texture = &copy.texture;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
@@ -749,6 +761,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        if count > 0 {
+            crate::indirect::end_batch(list);
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -786,7 +801,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
+    if let Some((copy, before)) = list.transition(resource, state) {
+        let texture = &copy.texture;
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
@@ -847,6 +863,30 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// The fork counted 402 copies between aliases of one host texture in five minutes.
+/// A whole-resource copy has no effect there. A region copy also needs matching coordinates.
+#[cfg(windows)]
+fn skip_alias_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_ALIAS_COPY").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+fn same_texels(src_sub: u32, dst_sub: u32, src_box: Option<&[u32; 6]>, dst: [u32; 3]) -> bool {
+    let origin = src_box.map_or([0; 3], |b| [b[0], b[1], b[2]]);
+    src_sub == dst_sub && origin == dst
+}
+
+#[cfg(windows)]
+fn note_alias_copy() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COPIES: AtomicU64 = AtomicU64::new(0);
+    let skipped = COPIES.fetch_add(1, Ordering::Relaxed) + 1;
+    if skipped.is_power_of_two() {
+        tracing::info!(skipped, "identical texture copies skipped");
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -871,6 +911,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
+            if skip_alias_copies()
+                && windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from)
+            {
+                crate::texture::host_written(dst);
+                note_alias_copy();
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -966,6 +1013,7 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        let mut identical = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -998,7 +1046,22 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if skip_alias_copies()
+                && src.kind == 0
+                && dst.kind == 0
+                && texture.as_raw() == to.as_raw()
+            {
+                // SAFETY: the caller supplies the optional box passed to CopyTextureRegion.
+                identical = same_texels(
+                    src.footprint.offset as u32,
+                    dst.footprint.offset as u32,
+                    unsafe { source_box.as_ref() },
+                    [x, y, z],
+                );
+            }
+            if !identical {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
@@ -1009,6 +1072,11 @@ extern "system" fn copy_texture_region(
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
+        if identical {
+            crate::texture::host_written(dst.resource);
+            note_alias_copy();
+            return;
+        }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
@@ -1410,10 +1478,20 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. Later indirect
+/// arguments may depend on this point, so they start a fresh clamp batch.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    end_indirect_interval(this);
+}
+
+fn end_indirect_interval(this: This) {
+    #[cfg(windows)]
+    if crate::indirect::batches() && let Some(list) = host_list(this) {
+        crate::indirect::end_batch(list);
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1745,6 +1823,11 @@ extern "system" fn execute_indirect(
 
 /// Indirect executions dropped since the last call.
 pub(crate) fn take_indirect() -> u64 {
+    #[cfg(windows)]
+    if crate::monitor::enabled() {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        return crate::monitor::log_count(&INDIRECT, &LAST);
+    }
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1758,10 +1841,33 @@ extern "system" fn dispatch(_: This) {
 static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(windows)]
+static CHECKPOINT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+pub(crate) fn monitor_counts() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [DRAWS.load(Relaxed), DISPATCHES.load(Relaxed), INDIRECT.load(Relaxed)]
+}
+
+/// Pending counts from recording threads, without draining the upstream checkpoint.
+#[cfg(windows)]
+pub(crate) fn counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let totals = (DRAWS.load(Relaxed), DISPATCHES.load(Relaxed));
+    if crate::monitor::enabled() {
+        (totals.0.saturating_sub(CHECKPOINT[0].load(Relaxed)), totals.1.saturating_sub(CHECKPOINT[1].load(Relaxed)))
+    } else { totals }
+}
+
 /// Draws (any kind, mesh and indirect included) and compute dispatches
 /// recorded since the last call.
 pub(crate) fn take_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    #[cfg(windows)]
+    if crate::monitor::enabled() {
+        return (crate::monitor::log_count(&DRAWS, &CHECKPOINT[0]), crate::monitor::log_count(&DISPATCHES, &CHECKPOINT[1]));
+    }
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
@@ -1897,6 +2003,7 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    end_indirect_interval(this);
     let wait = ValueWait {
         address,
         comparison,
@@ -1947,6 +2054,9 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    if count > 0 {
+        end_indirect_interval(this);
+    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2180,10 +2290,51 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
+fn list_functions(newer: bool) -> &'static Table<160> {
+    #[cfg(windows)]
+    {
+        static CLEARS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_CONSOLE_UAV_CLEAR").is_some_and(|v| v == "1")
+        });
+        if *CLEARS {
+            static OLD: Table<160> = Table(uav_clear::table(false));
+            static NEW: Table<160> = Table(uav_clear::table(true));
+            return if newer { &NEW } else { &OLD };
+        }
+    }
+    if newer {
+        &NEWER_LIST_FUNCTIONS
+    } else {
+        &LIST_FUNCTIONS
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn alias_region_must_cover_the_same_texels() {
+        use super::same_texels;
+        let region = [3, 2, 1, 20, 8, 4];
+        assert!(same_texels(1, 1, None, [0; 3]));
+        assert!(same_texels(1, 1, Some(&region), [3, 2, 1]));
+        assert!(!same_texels(1, 0, None, [0; 3]));
+        assert!(!same_texels(1, 1, Some(&region), [0; 3]));
+        assert!(!same_texels(1, 1, None, [1, 0, 0]));
+    }
+
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn mesh_and_reset_methods_in_both_layouts() {
+        for (newer, mesh, reset) in [(false, 127, 137), (true, 129, 139)] {
+            let table = list_table(newer);
+            assert_eq!(table[mesh], state::dispatch_mesh as *const ());
+            assert_eq!(table[10], super::reset as *const ());
+            assert_eq!(table[reset], reset_x as *const ());
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

@@ -29,6 +29,15 @@ use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, p
 use crate::bvh;
 use crate::resource::BvhNodes;
 
+thread_local! {
+    /// Approach after XCL 0fb82c6: resolve the memory containing each part
+    /// of a box before trusting its children. A missing directory entry
+    /// reads as zeros. A ray through the origin hits that zero-sized box.
+    pub(in crate::emit) static RESIDENT_BOXES: std::cell::Cell<bool> = std::cell::Cell::new(
+        std::env::var_os("VICTORY_BVH_RESIDENT_BOXES").is_some_and(|v| v == "1")
+    );
+}
+
 #[cfg(test)]
 thread_local! {
     /// The tests' stand-in for title memory ([`Lower::bvh_memory`]): a
@@ -47,7 +56,13 @@ enum NodeAt {
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
     /// and the node's address, for the second half of a 128-byte node.
-    Memory { handle: V, byte: V, low: V, high: V },
+    Memory {
+        handle: V,
+        byte: V,
+        low: V,
+        high: V,
+        copy: V,
+    },
 }
 
 /// The ray operands, as floats.
@@ -163,12 +178,13 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, guard);
+                let (handle, byte, copy) = self.bvh_memory(low, high, guard);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
+                    copy,
                 }
             }
         };
@@ -225,7 +241,7 @@ impl<'a> Lower<'a> {
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
     /// is left for the host to fetch, for lanes that run).
-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
+    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -242,15 +258,30 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at);
+            let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+            let copy = self.s.m.select(c, inside, one, zero);
+            return (handle, at, copy);
         }
-        self.memory(low, high, guard)
+        self.memory_entry(low, high, guard)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
+        self.bvh_words_and_tail(at, base, offset, count).0
+    }
+
+    /// Also returns the directory's copy number when the read crosses
+    /// byte 64 of a node in title memory. Box32 keeps its last two child
+    /// bounds there. The first two bounds end exactly at byte 64.
+    fn bvh_words_and_tail(
+        &mut self,
+        at: NodeAt,
+        base: Option<V>,
+        offset: u32,
+        count: u32,
+    ) -> (Vec<V>, Option<V>) {
         let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
@@ -263,13 +294,15 @@ impl<'a> Lower<'a> {
             let (handle, mut byte) = match at {
                 NodeAt::Buffer { handle, byte } => (handle, byte),
                 NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
-                NodeAt::Memory { low, high, .. } => *second.get_or_insert_with(|| {
-                    let (low, high) = self.address_plus(low, high, 64);
-                    // Every lane in this block runs the instruction.
-                    let (handle, byte) = self.bvh_memory(low, high, None);
-                    let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
-                }),
+                NodeAt::Memory { low, high, .. } => {
+                    let (handle, byte, _) = *second.get_or_insert_with(|| {
+                        let (low, high) = self.address_plus(low, high, 64);
+                        let (handle, byte, copy) = self.bvh_memory(low, high, None);
+                        let k64 = self.s.m.i32(64);
+                        (handle, self.s.m.bin(c, Bin::Sub, byte, k64), copy)
+                    });
+                    (handle, byte)
+                }
             };
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
@@ -290,7 +323,7 @@ impl<'a> Lower<'a> {
                 out.push(self.as_int(f));
             }
         }
-        out
+        (out, second.map(|(_, _, copy)| copy))
     }
 
     /// The node's title address, [`bvh::node_address`]: the descriptor's
@@ -328,7 +361,7 @@ impl<'a> Lower<'a> {
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let words = self.bvh_node_words(at, None, 16, 24);
+        let (words, tail_copy) = self.bvh_words_and_tail(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
@@ -354,6 +387,22 @@ impl<'a> Lower<'a> {
         }
         self.s.m.terminate(half_block, Term::Br(join));
         self.cur = join;
+        // All pointers are in the head. Box16 keeps every bound there too.
+        // Box32 can still visit children 0 and 1 if only its tail is missing.
+        let resident = match (at, tail_copy) {
+            (NodeAt::Memory { copy, .. }, Some(tail)) if RESIDENT_BOXES.get() => {
+                let bounds = self.s.m.phi(join, self.s.t.i32);
+                self.s
+                    .m
+                    .set_phi(bounds, vec![(tail, wide_block), (copy, half_block)]);
+                let zero = self.s.m.i32(0);
+                let head = self.s.m.cmp(join, pred::NE, copy, zero);
+                let bounds = self.s.m.cmp(join, pred::NE, bounds, zero);
+                let both = self.s.m.bin(join, Bin::And, head, bounds);
+                Some([head, head, both, both])
+            }
+            _ => None,
+        };
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
@@ -403,6 +452,10 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            let hit = match resident {
+                Some(available) => self.s.m.bin(c, Bin::And, hit, available[n]),
+                None => hit,
+            };
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

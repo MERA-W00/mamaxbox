@@ -572,8 +572,19 @@ fn twin_texture(
     }))
 }
 
+/// A8_UNORM stores alpha. An R8 view would interpret the same byte as red.
+fn alpha_family(separate: bool) -> u32 {
+    if separate { 65 } else { 60 }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
+    if format == 65 {
+        static ALPHA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let separate = *ALPHA
+            .get_or_init(|| std::env::var_os("VICTORY_A8_FORMAT_FAMILY").is_some_and(|v| v == "1"));
+        return alpha_family(separate);
+    }
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
         (5, 8),
@@ -587,7 +598,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -616,7 +627,8 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
-    let host = host_resource(this)?;
+    let copy = host_copy(this)?;
+    let host = &copy.texture;
     let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
@@ -1127,6 +1139,9 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// A raw accessor handed out this copy without an owner to delimit its
+    /// lifetime. Only the original idle sweep may release such a copy.
+    raw_borrow: std::sync::atomic::AtomicBool,
     /// Made without memory of its own (`crate::tiles`): the tiles its
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
@@ -1394,15 +1409,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
 /// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn host_made<'a>(
+pub(crate) fn host_made(
     this: This,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
     let (host, _) = hosted(this, false)?;
-    // SAFETY: as in `host_resource`.
-    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+    Some(host.texture.clone())
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1414,6 +1428,13 @@ pub(crate) fn host_made<'a>(
 /// the card's memory into the PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
+    texture_headroom(false) != 0
+}
+
+/// Bytes available under the indexed upload budget. The yes/no gate
+/// can stop at its guaranteed floor without querying the adapter.
+#[cfg(windows)]
+pub(crate) fn texture_headroom(exact: bool) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
@@ -1426,10 +1447,11 @@ pub(crate) fn room() -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return limit.saturating_sub(filled);
     }
-    if filled < FLOOR {
-        return true;
+    let floor = FLOOR.saturating_sub(filled);
+    if floor != 0 && !exact {
+        return floor;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
         // What is kept for card copies of title buffers not made yet
@@ -1437,9 +1459,10 @@ pub(crate) fn room() -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            let held = used + crate::shadow::card_room_kept() + targets_room_kept();
+            floor.max((budget / 100 * room_percent()).saturating_sub(held))
         }
-        None => filled < WITHOUT_BUDGET,
+        None => WITHOUT_BUDGET.saturating_sub(filled),
     }
 }
 
@@ -1509,6 +1532,201 @@ fn room_percent() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
     })
+}
+
+/// The indexed queue can wait for card memory even when the title's pages
+/// have arrived. Keep that demand until a fresh budget query allows uploads.
+#[cfg(windows)]
+static PRESSURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+pub(crate) static WAITING_UPLOADS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+pub(crate) static REQUEUED_UPLOADS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn uploads_waiting(count: u64, needed: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if count != 0 {
+        WAITING_UPLOADS.fetch_add(count, Relaxed);
+        PRESSURE.fetch_max(needed, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn eviction_frames() -> u64 {
+    static FRAMES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_TEXTURE_EVICT_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    *FRAMES
+}
+
+/// One observation under the submission lock. Any new view or list
+/// would first have to acquire the host copy and advance its use stamp.
+#[cfg(windows)]
+struct ColdCopy {
+    address: usize,
+    used: u64,
+    observed: u64,
+    submitted: u64,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct ColdTextures {
+    frame: Option<u64>,
+    cursor: usize,
+    copies: std::collections::VecDeque<ColdCopy>,
+}
+
+#[cfg(windows)]
+impl ColdTextures {
+    fn unbound(host: &std::sync::Arc<HostTexture>) -> bool {
+        host.filled
+            && !host.raw_borrow.load(std::sync::atomic::Ordering::Relaxed)
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) == 1
+    }
+
+    /// The caller pins every resource in the registry through this pass.
+    fn reclaim(
+        &mut self,
+        all: &std::collections::BTreeSet<usize>,
+        now: u64,
+        age: u64,
+        submitted: u64,
+        finished: u64,
+        mut has_room: impl FnMut() -> bool,
+    ) -> u64 {
+        use std::ops::Bound::{Excluded, Unbounded};
+        use std::sync::atomic::Ordering::Relaxed;
+        let frame = now >> 32;
+        self.frame = Some(frame);
+        let mut reclaimed = 0;
+        // The table lock pins the title object. Reacquire its host lock
+        // before testing ownership and discarding its staging state.
+        for _ in 0..256 {
+            let Some(copy) = self.copies.front() else {
+                break;
+            };
+            if frame.saturating_sub(copy.observed) < age || finished < copy.submitted {
+                break;
+            }
+            let copy = self.copies.pop_front().unwrap();
+            if !all.contains(&copy.address) {
+                continue;
+            }
+            // SAFETY: removal from `all` precedes destruction.
+            let r = unsafe { &*(copy.address as *const Resource) };
+            let Ok(mut made) = r.host.made.try_lock() else {
+                continue;
+            };
+            let Some((host, _)) = made.as_ref() else {
+                continue;
+            };
+            if r.host.used.load(Relaxed) != copy.used
+                || !Self::unbound(host)
+                || crate::texture::host_wrote(copy.address)
+            {
+                continue;
+            }
+            let bytes = host.tiled.as_ref().map_or(host.bytes, |t| t.given_bytes());
+            if bytes == 0 {
+                continue;
+            }
+            crate::texture::unstage(copy.address as This);
+            drop(made.take());
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(bytes, Relaxed);
+            reclaimed += 1;
+            drop(made);
+            if has_room() || reclaimed == 8 {
+                break;
+            }
+        }
+        // A rolling window bounds work on the submitting thread and lets
+        // a large registry make progress past its first pinned textures.
+        let start = self.cursor;
+        let mut walked = 0;
+        for &address in all.range((Excluded(start), Unbounded)).take(256) {
+            if self.copies.len() >= 2048 {
+                break;
+            }
+            self.cursor = address;
+            walked += 1;
+            // SAFETY: the registry lock still pins this object.
+            let r = unsafe { &*(address as *const Resource) };
+            let Ok(made) = r.host.made.try_lock() else {
+                continue;
+            };
+            let Some((host, _)) = made.as_ref() else {
+                continue;
+            };
+            let used = r.host.used.load(Relaxed);
+            // Require a strictly earlier stamp. Even a new lookup later
+            // in this same frame will then invalidate the observation.
+            if used >> 32 < frame && Self::unbound(host) && !crate::texture::host_wrote(address) {
+                self.copies.push_back(ColdCopy {
+                    address,
+                    used,
+                    observed: frame,
+                    submitted,
+                });
+            }
+        }
+        if walked < 256 && self.copies.len() < 2048 {
+            self.cursor = 0;
+        }
+        reclaimed
+    }
+}
+
+/// Called under the submission lock. The completion count must cover every
+/// submission that could have seen the copy before it was found unbound.
+/// A shader can sample any live bindless slot, so only an unbound copy
+/// observed across the entire cold interval is eligible. A refused upload
+/// stays on its existing queue and spends the ordinary budget on retry.
+/// `VICTORY_TEXTURE_EVICT_FRAMES` sets the minimum interval between
+/// observations. Zero (the default) leaves reclamation to the usual sweep.
+#[cfg(windows)]
+pub(crate) fn reclaim_for_uploads(submitted: u64, finished: u64) {
+    use std::sync::{LazyLock, Mutex, atomic::Ordering::Relaxed};
+    let frames = eviction_frames();
+    static COLD: LazyLock<Mutex<ColdTextures>> =
+        LazyLock::new(|| Mutex::new(ColdTextures::default()));
+    if frames == 0 || PRESSURE.load(Relaxed) == 0 {
+        return;
+    }
+    let mut cold = COLD.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::moment();
+    if cold.frame == Some(now >> 32) {
+        return;
+    }
+    // Consume before querying so a concurrent refusal keeps its request.
+    let needed = PRESSURE.swap(0, Relaxed);
+    let has_room = || {
+        if needed <= 1 {
+            room()
+        } else {
+            texture_headroom(true) >= needed
+        }
+    };
+    if has_room() {
+        cold.copies.clear();
+        cold.frame = Some(now >> 32);
+        return;
+    }
+    PRESSURE.fetch_max(needed, Relaxed);
+    let count = cold.reclaim(&textures(), now, frames, submitted, finished, has_room);
+    EVICTIONS.fetch_add(count, Relaxed);
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -1944,6 +2162,12 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    fn note_raw_borrow(&self) {
+        if self.filled && eviction_frames() != 0 {
+            self.raw_borrow.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -1954,6 +2178,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            raw_borrow: std::sync::atomic::AtomicBool::new(false),
             tiled: None,
         }
     }
@@ -1971,6 +2196,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
+            raw_borrow: std::sync::atomic::AtomicBool::new(false),
             tiled: Some(tiled),
         }
     }
@@ -1980,6 +2206,7 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        texture_heaps::let_go(&self.texture);
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2005,7 +2232,10 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.texture.as_raw(), before))
+    (before != wanted).then(|| {
+        host.note_raw_borrow();
+        (host.texture.as_raw(), before)
+    })
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if
@@ -2019,6 +2249,9 @@ pub(crate) fn host_resource<'a>(
         return None;
     }
     let (host, _) = hosted(this, true)?;
+    // The old raw API ties no owner to its result. Keep these copies out
+    // of pressure reclamation even when the caller stalls across frames.
+    host.note_raw_borrow();
     // SAFETY: the resource holds the host copy until the title releases it
     // (lists and slots that name the texture hold it past that), or until
     // `let_go_idle` takes it: only from a texture the title fills, that no
@@ -2045,6 +2278,149 @@ fn host_texture(
     clear: *const c_void,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     host_texture_as(desc, state, clear, false)
+}
+
+/// Sampled textures can share a heap without sharing any of its bytes.
+/// Use fresh, zero-initialized ranges only: sparse or unsupported uploads
+/// can leave some mip levels untouched.
+#[cfg(windows)]
+mod texture_heaps {
+    use kelvaroq_render::heap_ranges::HeapRanges;
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::{GUID, Interface};
+
+    const HEAP_BYTES: u64 = 256 << 20;
+    // Private data of the D3D12 resource, retained until its last COM
+    // reference goes, including references on recorded or submitted lists.
+    const BACKING_HEAP: GUID = GUID::from_u128(0x49aa3cb7_3e15_4cca_a5db_58d4c5912168);
+
+    struct Page {
+        heap: ID3D12Heap,
+        fresh: HeapRanges,
+        owners: HashSet<usize>,
+    }
+
+    impl Page {
+        fn new(device: &ID3D12Device, bytes: u64) -> Option<Self> {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: bytes,
+                Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                ..Default::default()
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation with a zero-initialized default heap.
+            unsafe { device.CreateHeap(&desc, &mut heap) }.ok()?;
+            let heap = heap?;
+            crate::host::name(&heap, || "texture heap".to_owned());
+            Some(Self { heap, fresh: HeapRanges::new(bytes), owners: HashSet::new() })
+        }
+
+        fn place(&mut self, device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32, at: u64, size: u64) -> Option<ID3D12Resource> {
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: at and size come from the device's allocation query.
+            // The range has never been exposed via another GPU resource.
+            // Keeping the heap on the resource also covers standalone COM
+            // clones that may outlive the HostTexture that created it.
+            let made = unsafe {
+                device.CreatePlacedResource(&self.heap, at, desc, D3D12_RESOURCE_STATES(state as i32), None, &mut texture).ok()
+                    .and_then(|()| texture.as_ref()?.SetPrivateDataInterface(&BACKING_HEAP, &self.heap).ok())
+            };
+            if made.is_none() {
+                // Creation failed before this range was ever handed out.
+                self.fresh.release(at, size);
+                return None;
+            }
+            let texture = texture?;
+            self.owners.insert(texture.as_raw() as usize);
+            Some(texture)
+        }
+        /// All ranges ever published stay consumed until their heap goes.
+        fn forget(&mut self, texture: &ID3D12Resource) -> bool {
+            self.owners.remove(&(texture.as_raw() as usize)) && self.owners.is_empty()
+        }
+    }
+
+    static CURRENT: Mutex<Option<Page>> = Mutex::new(None);
+
+    /// VICTORY_TEXTURE_HEAPS=1 enables the placement experiment; the fork's
+    /// committed allocations remain the default until the scene is measured.
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HEAPS").is_some_and(|v| v == "1"))
+    }
+
+    pub(super) fn place(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: u32) -> Option<ID3D12Resource> {
+        if !on() {
+            return None;
+        }
+        // SAFETY: a description of a non-MSAA sampled texture.
+        let info = unsafe { device.GetResourceAllocationInfo(0, std::slice::from_ref(desc)) };
+        if info.SizeInBytes == 0 || info.SizeInBytes > HEAP_BYTES / 4 {
+            return None;
+        }
+        let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(page) = current.as_mut()
+            && let Some(at) = page.fresh.alloc(info.SizeInBytes, info.Alignment)
+        {
+            return page.place(device, desc, state, at, info.SizeInBytes);
+        }
+        let mut page = Page::new(device, HEAP_BYTES)?;
+        let at = page.fresh.alloc(info.SizeInBytes, info.Alignment)?;
+        let texture = page.place(device, desc, state, at, info.SizeInBytes)?;
+        // Old pages are now owned solely by their live D3D12 resources.
+        *current = Some(page);
+        Some(texture)
+    }
+
+    pub(super) fn let_go(texture: &ID3D12Resource) {
+        if on() {
+            let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(page) = current.as_mut()
+                && page.forget(texture)
+            {
+                // Relinquish the allocator's reference, even if the page
+                // has room. Individual successful placements are never reused.
+                *current = None;
+            }
+        }
+    }
+    #[test]
+    fn a_retired_placement_stays_consumed_and_a_resource_clone_holds_the_heap() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::core::IUnknown;
+        let Some(host) = crate::host::host() else { return };
+        let device = &host.device;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 32, Height: 32, DepthOrArraySize: 1, MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: a valid single-sample texture description.
+        let info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
+        let size = info.SizeInBytes;
+        let mut page = Page::new(device, 2 << 20).unwrap();
+        let at = page.fresh.alloc(size, info.Alignment).unwrap();
+        let texture = page.place(device, &desc, 0, at, size).unwrap();
+        let held = texture.clone(); // A list can still hold the resource.
+        assert!(page.forget(&texture));
+        drop(texture);
+        assert!(page.fresh.alloc(size, info.Alignment).unwrap() >= at + size);
+        drop(page);
+        let mut owner: Option<IUnknown> = None;
+        let mut bytes = std::mem::size_of_val(&owner) as u32;
+        // SAFETY: GetPrivateData returns an owned IUnknown reference in
+        // the pointer-sized slot for a SetPrivateDataInterface entry.
+        unsafe { held.GetPrivateData(&BACKING_HEAP, &mut bytes, Some((&raw mut owner).cast())) }.unwrap();
+        let heap = owner.unwrap().cast::<ID3D12Heap>().unwrap();
+        // SAFETY: the retained interface is a live heap.
+        assert_eq!(unsafe { heap.GetDesc() }.SizeInBytes, 2 << 20);
+    }
+
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2126,20 +2502,26 @@ fn host_texture_as(
             )
         }
     } else {
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
-                // The same layout: format, then color or depth and stencil.
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-                &mut texture,
-            )
+        let state = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+        // SAFETY: the description has the host layout (checked size, same fields).
+        let host_desc = unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
+        if d.flags & (TARGET | DEPTH | UNORDERED) == 0 && d.sample_count == 1 && clear_value.is_none()
+            && let Some(placed) = texture_heaps::place(&host.device, host_desc, state)
+        {
+            texture = Some(placed);
+            Ok(())
+        } else {
+            // SAFETY: a valid host description and clear value; the out pointer is ours.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    host_desc,
+                    D3D12_RESOURCE_STATES(state as i32),
+                    clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                    &mut texture,
+                )
+            }
         }
     };
     if let Err(e) = made {
@@ -2200,11 +2582,13 @@ impl OnDemand {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room());
+        let (changed, needed) = tiled.uploaded(&self.0.texture, held);
+        let waiting = needed != 0;
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
         if waiting {
+            uploads_waiting(1, needed);
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         waiting
@@ -2310,8 +2694,10 @@ fn hand_out_resource(
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        let read_only = desc.flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32 == 0;
+        crate::shadow::register_buffer(at, resource.data() as u64, desc.width, read_only);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -2819,6 +3205,14 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn alpha_views_have_their_own_format_family_when_requested() {
+        assert_eq!(super::alpha_family(true), 65);
+        assert_eq!(super::alpha_family(false), 60);
+        for format in 60..=64 {
+            assert_eq!(super::family(format), 60);
+        }
+    }
     use super::*;
     use crate::object::slot;
 
@@ -2875,6 +3269,88 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cold_eviction_observes_ownership_age_and_the_upload_budget() {
+        use std::sync::atomic::Ordering::Relaxed;
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let images = [(); 7].map(|()| {
+            let mut image = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &texture(16, 16, 28, 1),
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut image
+                ),
+                S_OK
+            );
+            drop(host_copy(image).unwrap());
+            resource(image).host.used.store(1, Relaxed);
+            image
+        });
+        let registry = images.map(|image| image as usize).into_iter().collect();
+        let at = |frame: u64| (frame << 32) | 20;
+        let mut cold = ColdTextures::default();
+        assert_eq!(cold.reclaim(&registry, at(10), 3, 12, 6, || false), 0);
+        assert_eq!(cold.copies.len(), 7);
+        // Acquire the same owners that a list and a descriptor hold. Leave
+        // their stamps alone to exercise the independent ownership checks.
+        let copy = |i: usize| {
+            resource(images[i])
+                .host
+                .made
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .clone()
+        };
+        let list = copy(2);
+        let slot = copy(3).texture.clone();
+        drop(host_copy(images[4]).unwrap());
+        resource(images[4]).host.used.store(at(11), Relaxed);
+        crate::texture::host_written(images[5]);
+        copy(6).raw_borrow.store(true, Relaxed);
+        assert_eq!(cold.reclaim(&registry, at(12), 3, 13, 11, || false), 0);
+        // The cold interval elapsed, but a submission that could have sampled it is still running.
+        assert_eq!(cold.reclaim(&registry, at(13), 3, 14, 11, || false), 0);
+        let before = KINDS[1].load(Relaxed);
+        // As soon as one copy's bytes fit, keep the other cold copy.
+        assert_eq!(
+            cold.reclaim(&registry, at(14), 3, 15, 12, || KINDS[1].load(Relaxed)
+                < before),
+            1
+        );
+        let present = images.map(|r| resource(r).host.made.lock().unwrap().is_some());
+        assert_ne!(present[0], present[1]);
+        assert!(present[2..].iter().all(|&p| p));
+        // With further demand, examine the rest of the original observations.
+        // Only the other cold copy can go while the newer submissions run.
+        assert_eq!(cold.reclaim(&registry, at(15), 4, 16, 12, || false), 1);
+        assert!(
+            images[2..]
+                .iter()
+                .all(|&r| resource(r).host.made.lock().unwrap().is_some())
+        );
+        for &image in &images[..2] {
+            assert!(host_copy(image).is_some());
+        }
+        assert_eq!(KINDS[1].load(Relaxed), before);
+        drop((list, slot));
+        for image in images {
+            resource_release(image);
+        }
     }
 
     #[test]
@@ -3986,5 +4462,97 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// Run alone with VICTORY_CARD_READONLY_MB=0 or 1 and the usual 1 MiB
+    /// threshold for large buffers. A UAV view of a larger, overlapping
+    /// resource resolves to the smaller read-only resource's DEFAULT copy.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device and VICTORY_CARD_READONLY_MB=0 or 1"]
+    fn small_readonly_buffer_uploads_and_returns_an_alias_shader_write() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let host = crate::host::host().expect("D3D12 device");
+        let on = match std::env::var("VICTORY_CARD_READONLY_MB").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => panic!("run with VICTORY_CARD_READONLY_MB=0 or 1"),
+        };
+        let heap = heap(3 * KIB_64);
+        let place = |offset, desc: ResourceDesc| {
+            let mut resource = std::ptr::null();
+            assert_eq!(
+                create_placed(std::ptr::null(), heap, offset, &desc, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut resource),
+                S_OK
+            );
+            resource
+        };
+        let writable = place(0, ResourceDesc {
+            flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32,
+            ..buffer(3 * KIB_64)
+        });
+        let readonly = place(KIB_64, buffer(KIB_64));
+        let base = gpu_address(writable);
+        let address = gpu_address(readonly);
+        assert_eq!(address, base + KIB_64);
+        assert!(!crate::shadow::find(base, 3 * KIB_64).unwrap().carded());
+        let copy = crate::shadow::find(address, KIB_64).unwrap();
+        assert_eq!(copy.carded(), on, "placement of the registered read-only buffer");
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        if let Some((staging, _, _)) = copy.card_sides() {
+            // SAFETY: both resources belong to the live copy.
+            unsafe {
+                copy.buffer.GetHeapProperties(Some(&mut props), None).unwrap();
+                assert_eq!(props.Type, D3D12_HEAP_TYPE_DEFAULT);
+                staging.GetHeapProperties(Some(&mut props), None).unwrap();
+            }
+        } else {
+            // SAFETY: the ordinary shared buffer is live.
+            unsafe { copy.buffer.GetHeapProperties(Some(&mut props), None).unwrap() };
+        }
+        assert_eq!(props.CPUPageProperty, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK);
+        assert_eq!(props.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
+        let view = base + KIB_64 + 256;
+        let alias = crate::shadow::find(view, 8).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&copy, &alias));
+
+        let code = crate::host::compile(
+            r#"RWByteAddressBuffer words : register(u0);
+               [RootSignature("UAV(u0)")][numthreads(1,1,1)]
+               void main() { words.Store(4, words.Load(0) + 7); }"#,
+            windows::core::s!("main"), windows::core::s!("cs_5_1"),
+        ).unwrap();
+        // SAFETY: the root signature and compute bytecode belong to this shader.
+        let (root, pipeline): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, &code).unwrap();
+            let pipeline = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            }).unwrap();
+            (root, pipeline)
+        };
+        let list = host.new_list().unwrap();
+        let words = view as *mut u32;
+        // SAFETY: the view holds two aligned words in our live test heap.
+        unsafe { words.write(0x12345678) };
+        copy.refresh(&list, address, KIB_64);
+        alias.gpu_writes(&list, view + 4, 4);
+        // SAFETY: the root UAV covers both words inside the DEFAULT buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pipeline);
+            list.list.SetComputeRootUnorderedAccessView(0, alias.buffer.GetGPUVirtualAddress() + (view - address));
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the synchronous submission finished, including its copy-back.
+        assert_eq!(unsafe { words.add(1).read() }, 0x1234567f);
+        assert_eq!(unsafe { words.read() }, 0x12345678);
+        assert_eq!(slot::<Release>(readonly, 0x10)(readonly), 0);
+        assert_eq!(slot::<Release>(writable, 0x10)(writable), 0);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
     }
 }

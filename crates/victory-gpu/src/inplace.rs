@@ -49,6 +49,9 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, s};
 use windows_sys::Win32::System::Memory as mem;
 
+pub(crate) mod pool;
+pub use pool::{PoolCommit, title_memory_section_closed, uma_pool};
+
 /// The unit heaps and placed buffers are cut on, and the console's page.
 const K64: usize = 64 << 10;
 /// The host's write watching (not in windows-sys' memory module).
@@ -90,6 +93,24 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// Approach after XCL f3b15b9: bind a buffer over committed title pages.
+/// The census found private buffers small enough to keep in system memory.
+/// Keep the experimental policy independent of the older placement modes.
+pub(crate) fn private_reads() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_UMA").is_some_and(|v| v == "1")
+            && std::env::var_os("VICTORY_UMA_PRIVATE").is_none_or(|v| v == "1")
+    })
+}
+
+/// Detached constants can open one or two private pages for a single list.
+/// The hardware probe found opening itself costly, so measure it separately.
+pub(crate) fn private_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| private_reads() && std::env::var_os("VICTORY_UMA_PRIVATE_CBV").is_some_and(|v| v == "1"))
+}
+
 /// The most title memory in place at once, in bytes
 /// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
 /// memory, also those the title never touched.
@@ -103,6 +124,24 @@ fn most() -> u64 {
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static OPEN_BYTES: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Several small buffers can open the same page. Charge each opening to
+/// the budget because each placed resource keeps its opening alive.
+fn opening(start: u64, len: u64) -> Option<(u64, u64)> {
+    let page = K64 as u64;
+    let at = start - start % page;
+    let end = start.checked_add(len.max(1))?.checked_next_multiple_of(page)?;
+    Some((at, end - at))
+}
+
+pub(crate) fn skipped(requests: u64, bytes: u64) {
+    SKIPPED[0].fetch_add(requests, Ordering::Relaxed);
+    SKIPPED[1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn monitor_bytes() -> u64 { STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) }
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -119,8 +158,7 @@ pub(crate) struct Placed {
 /// with nothing if the memory is not private memory committed whole
 /// (nothing was asked of the host), with the host's error if it refused.
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
-    let at = start & !(K64 as u64 - 1);
-    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let (at, bytes) = opening(start, len).ok_or(None)?;
     if !private_whole(at as usize, bytes as usize) {
         return Err(None);
     }
@@ -134,8 +172,9 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
-pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+pub(crate) fn place_for(start: u64, len: u64, window: bool, read_only: bool) -> Option<Placed> {
+    let enabled = if private_reads() { read_only } else { level() >= if window { 1 } else { 2 } };
+    if !enabled {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
@@ -143,14 +182,27 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    let host = crate::host::host()?;
+    let (_, bytes) = opening(start, len)?;
+    let fits = if private_reads() {
+        OPEN_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            live.checked_add(bytes).filter(|&total| total <= most())
+        }).is_ok()
+    } else {
+        STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len <= most()
+    };
+    if !fits {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = place_part(&host.device, start, len);
+    if placed.is_err() && private_reads() {
+        OPEN_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    }
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
+            if crate::monitor::enabled() { crate::monitor::placed_pages(start, len, true); }
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
             Some(placed)
@@ -169,7 +221,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 }
 
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+pub(crate) fn gone(window: bool, start: u64, bytes: u64) {
+    if private_reads() {
+        OPEN_BYTES.fetch_sub(opening(start, bytes).unwrap().1, Ordering::Relaxed);
+    }
+    if crate::monitor::enabled() { crate::monitor::placed_pages(start, bytes, false); }
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
@@ -197,7 +253,18 @@ fn say() {
     if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
+    if uma_pool() { pool::say(); }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    if private_reads() {
+        let bytes = OPEN_BYTES.load(Ordering::Relaxed);
+        tracing::info!(
+            placed_pages = bytes / K64 as u64,
+            placed_mib = bytes >> 20,
+            skipped_refresh_requests = SKIPPED[0].swap(0, Ordering::Relaxed),
+            skipped_requested_bytes = SKIPPED[1].swap(0, Ordering::Relaxed),
+            "UMA private placement and refresh requests since the previous sample"
+        );
+    }
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
@@ -274,10 +341,22 @@ struct Views {
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    charges: BTreeMap<usize, std::sync::Arc<PoolCommit>>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new(), charges: BTreeMap::new() });
+
+pub(crate) fn any_view(start: usize, end: usize, used: fn(usize, u64, usize) -> bool) -> bool {
+    if start >= end { return false; }
+    let v = views();
+    let first = v.views.range(..=start).next_back().map_or(start, |(&base, _)| base);
+    v.views.range(first..end).any(|(&base, &(size, section, offset))| {
+        let lo = base.max(start);
+        let hi = (base + size).min(end);
+        lo < hi && used(section, offset + (lo - base) as u64, hi - lo)
+    })
+}
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -296,6 +375,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views();
+        pool::changed();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
@@ -318,6 +398,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
+    if !gone.is_empty() { pool::changed(); }
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
@@ -452,6 +533,24 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
         && info.Type == mem::MEM_PRIVATE
         && info.Protect == mem::PAGE_READWRITE
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at.saturating_add(len)
+}
+
+/// Vérifie que toutes les plages ont des adresses privées disjointes.
+/// Deux vues de section peuvent partager les mêmes octets. Les copies de
+/// ces vues gardent leur ordre. Conserver la garde jusqu’à la dernière copie.
+pub(crate) fn private_copy_ranges(copies: &[(usize, usize, usize)], _mapping: &crate::watch::Reading) -> bool {
+    let mut ranges = Vec::new();
+    for &(dst, src, len) in copies {
+        for at in [dst, src] {
+            let Some(end) = at.checked_add(len) else { return false };
+            if len == 0 || !private_whole(at, len) {
+                return false;
+            }
+            ranges.push((at, end));
+        }
+    }
+    ranges.sort_unstable();
+    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0)
 }
 
 fn hr<T>(result: &windows::core::Result<T>) -> String {
@@ -1063,7 +1162,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
-    if level() > 0 {
+    if level() > 0 || private_reads() || uma_pool() {
         say();
     }
     if probe_level() == 0 {
@@ -1112,6 +1211,15 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_opening_counts_both_edge_pages_and_refuses_overflow() {
+        let page = K64 as u64;
+        assert_eq!(opening(2 * page - 1, 2), Some((page, 2 * page)));
+        assert_eq!(opening(page, page), Some((page, page)));
+        assert_eq!(opening(u64::MAX - 2, 2), None);
+        assert_eq!(opening(u64::MAX, 2), None);
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
@@ -1228,6 +1336,7 @@ mod tests {
             assert_eq!(placed.bias, 0x1230);
             assert_eq!(placed.gpu, placed.buffer.GetGPUVirtualAddress() + 0x1230);
             assert_eq!(placed.buffer.GetDesc().Width, 3 * K64 as u64, "the pages that hold the buffer");
+            assert!(crate::tiles::rejects_test_heap(placed.heap.clone()), "title pages cannot supply tiles");
             let mut rig = Rig::new(&device).unwrap();
             fill(start as *mut u8, len as usize, 7);
             let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
@@ -1239,6 +1348,58 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Two offsets of a committed section have different contents. Keep
+    /// the first GPU binding alive while the same title address moves.
+    #[test]
+    fn warp_section_binding_follows_views_and_keeps_the_old_offset_alive() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        let Some(device) = warp() else { return };
+        let mut rig = Rig::new(&device).unwrap();
+        unsafe {
+            let size = 2 * K64;
+            let handle = mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
+                mem::SEC_COMMIT | mem::PAGE_READWRITE, 0, size as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            let writer = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, size);
+            assert!(!writer.Value.is_null());
+            let data = writer.Value.cast::<u8>();
+            fill(data, K64, 37);
+            fill(data.add(K64), K64, 91);
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let slot = mem::VirtualAlloc2(process, std::ptr::null(), K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                mem::PAGE_NOACCESS, std::ptr::null_mut(), 0);
+            assert!(!slot.is_null());
+            title_memory_section(handle as usize, size as u64, true);
+            let show = |offset: usize| {
+                let mapped = mem::MapViewOfFile3(handle, process, slot, offset as u64, K64,
+                    mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert_eq!(mapped.Value, slot);
+                title_memory_view(slot as usize, K64, handle as usize, offset as u64);
+                mapped
+            };
+            let hide = |mapped| {
+                assert_ne!(mem::UnmapViewOfFile2(process, mapped, mem::MEM_PRESERVE_PLACEHOLDER), 0);
+                views_gone(slot as usize, K64);
+            };
+            let first = show(0);
+            let (old, old_offset) = pool::resolve(&device, slot as usize + 256, 256).unwrap();
+            hide(first);
+            assert!(pool::resolve(&device, slot as usize, 256).is_none());
+            let second = show(K64);
+            let (new, new_offset) = pool::resolve(&device, slot as usize + 256, 256).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&old, &new));
+            assert_eq!((old_offset, new_offset), (256, K64 as u64 + 256));
+            assert!(same(data.add(256), &rig.fetch(&old.buffer, old_offset, 256).unwrap()));
+            assert!(same(data.add(K64 + 256), &rig.fetch(&new.buffer, new_offset, 256).unwrap()));
+            assert!(pool::resolve(&device, slot as usize + K64 - 1, 2).is_none());
+            hide(second);
+            let _charge = title_memory_section_closed(handle as usize);
+            assert_ne!(mem::UnmapViewOfFile(writer), 0);
+            assert_ne!(CloseHandle(handle), 0);
+            assert_ne!(mem::VirtualFree(slot, 0, mem::MEM_RELEASE), 0);
         }
     }
 

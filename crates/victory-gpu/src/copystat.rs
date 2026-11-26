@@ -137,6 +137,8 @@ pub(crate) enum C {
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
+pub(crate) fn monitor_count(c: C) -> u64 { COUNT[c as usize].load(Relaxed) }
+
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
@@ -1080,9 +1082,11 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
+    static LAST: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
     let c: Vec<f64> = COUNT
         .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .zip(&LAST)
+        .map(|(a, last)| crate::monitor::log_count(a, last) as f64 / frames)
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;

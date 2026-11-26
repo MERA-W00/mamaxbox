@@ -537,15 +537,60 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+/// Approach after XCL ed56bca: a title can ask either resolver for the
+/// host's own name. Resolve that spelling through loopback so both IPv4
+/// and IPv6 stay local, including when Winsock completes the call later.
+fn same_host(name: &str, hostname: &str) -> bool {
+    !hostname.is_empty() && name.eq_ignore_ascii_case(hostname)
+}
+
+fn forward_name<T>(
+    name: Option<String>,
+    original: *const T,
+    localhost: *const T,
+) -> Option<*const T> {
+    static ALIAS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VICTORY_NETWORK_LOCAL_NAME").is_some_and(|v| v == "1")
+    });
+    if *ALIAS && let Some(query) = name.as_deref() {
+        // Winsock can fail before WSAStartup. Cache only a successful name.
+        static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if HOST.get().is_none() {
+            let mut buf = [0i8; 256];
+            if host!("ws2_32.dll", "gethostname": extern "system" fn(*mut c_char, i32) -> i32)(
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            ) == 0
+                && let Some(local) = narrow(buf.as_ptr())
+            {
+                let _ = HOST.set(local);
+            }
+        }
+        if HOST.get().is_some_and(|local| same_host(query, local)) {
+            return Some(localhost);
+        }
+    }
+    resolvable(name).then_some(original)
+}
+
+fn forward_a(name: *const c_char) -> Option<*const c_char> {
+    forward_name(narrow(name), name, c"localhost".as_ptr())
+}
+
+fn forward_w(name: *const u16) -> Option<*const u16> {
+    const LOCAL: &[u16] = &[108, 111, 99, 97, 108, 104, 111, 115, 116, 0];
+    forward_name(wide(name), name, LOCAL.as_ptr())
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(narrow(node)) {
+    let Some(node) = forward_a(node) else {
         return WSAHOST_NOT_FOUND;
-    }
+    };
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -557,9 +602,9 @@ pub extern "system" fn GetAddrInfoW(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(wide(node)) {
+    let Some(node) = forward_w(node) else {
         return WSAHOST_NOT_FOUND;
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -577,9 +622,9 @@ pub extern "system" fn GetAddrInfoExA(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(narrow(name)) {
+    let Some(name) = forward_a(name) else {
         return WSAHOST_NOT_FOUND;
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
@@ -597,18 +642,18 @@ pub extern "system" fn GetAddrInfoExW(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(wide(name)) {
+    let Some(name) = forward_w(name) else {
         return WSAHOST_NOT_FOUND;
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
 
 pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
-    if !resolvable(narrow(name)) {
+    let Some(name) = forward_a(name) else {
         return std::ptr::null_mut();
-    }
+    };
     host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)(name)
 }
 
@@ -619,9 +664,9 @@ pub extern "system" fn WSAAsyncGetHostByName(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
-    if !resolvable(narrow(name)) {
+    let Some(name) = forward_a(name) else {
         return std::ptr::null_mut();
-    }
+    };
     host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)(
         window, message, name, buf, buf_len,
     )
@@ -880,6 +925,12 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_resolver_alias_requires_the_entire_host_name() {
+        assert!(super::same_host("UNIT-HOST", "unit-host"));
+        assert!(!super::same_host("unit-host.example", "unit-host"));
+        assert!(!super::same_host("", ""));
+    }
     use super::*;
     use victory_pe::ImportSymbol;
 

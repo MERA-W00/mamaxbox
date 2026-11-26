@@ -22,6 +22,26 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    static NORMALIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let normalized = *NORMALIZED
+        .get_or_init(|| std::env::var_os("VICTORY_RECT_NORMALIZED").is_some_and(|v| v == "1"));
+    let guard = *GUARD
+        .get_or_init(|| std::env::var_os("VICTORY_RECT_STRIDE_GUARD").is_some_and(|v| v == "1"));
+    expand(src, dst, stride, elements, normalized, guard);
+}
+
+fn expand(
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+    elements: &[(u32, u32)],
+    normalized: bool,
+    guard: bool,
+) {
+    if guard && (stride == 0 || stride.checked_mul(6).is_none()) {
+        return;
+    }
     for (rect, out) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
@@ -34,7 +54,7 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         fourth.copy_from_slice(v(0));
         for &(offset, format) in elements {
             let at = offset as usize;
-            let Some((n, kind)) = components(format) else {
+            let Some((n, kind)) = components(format, normalized) else {
                 continue;
             };
             // Only the components inside the vertex: the rest belong to the
@@ -55,10 +75,12 @@ enum Kind {
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
 }
 
 /// Component count and kind of the vertex formats rectangles use.
-fn components(format: u32) -> Option<(usize, Kind)> {
+fn components(format: u32, normalized: bool) -> Option<(usize, Kind)> {
     Some(match format {
         2 => (4, Kind::F32),
         6 => (3, Kind::F32),
@@ -69,7 +91,16 @@ fn components(format: u32) -> Option<(usize, Kind)> {
         54 => (1, Kind::F16),
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
+        56 if normalized => (1, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        49 if normalized => (2, Kind::Unorm8),
+        61 if normalized => (1, Kind::Unorm8),
+        13 if normalized => (4, Kind::Snorm16),
+        37 if normalized => (2, Kind::Snorm16),
+        58 if normalized => (1, Kind::Snorm16),
+        31 if normalized => (4, Kind::Snorm8),
+        51 if normalized => (2, Kind::Snorm8),
+        63 if normalized => (1, Kind::Snorm8),
         _ => return None,
     })
 }
@@ -78,8 +109,8 @@ impl Kind {
     fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
+            Kind::F16 | Kind::Unorm16 | Kind::Snorm16 => 2,
+            Kind::Unorm8 | Kind::Snorm8 => 1,
         }
     }
 
@@ -90,6 +121,8 @@ impl Kind {
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
             Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
             Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -103,6 +136,10 @@ impl Kind {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
             Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Kind::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }
@@ -155,6 +192,52 @@ fn f32_to_half(v: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalized_attributes_are_interpolated_in_their_own_range() {
+        let vertex = |rg: [u8; 2], u16_value: u16, u8_value: u8, snorm8: i8, snorm16: i16| {
+            [
+                &rg[..],
+                &u16_value.to_le_bytes(),
+                &[u8_value, snorm8 as u8],
+                &snorm16.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let src = [
+            vertex([3, 250], 1000, 10, i8::MIN, -23000),
+            vertex([8, 200], 500, 3, -120, -18000),
+            vertex([20, 253], 10000, 100, -120, -32000),
+        ]
+        .concat();
+        let mut dst = [0; 6 * 8];
+        expand(
+            &src,
+            &mut dst,
+            8,
+            &[(0, 49), (2, 56), (4, 61), (5, 63), (6, 58)],
+            true,
+            true,
+        );
+        assert_eq!(dst[40..], vertex([15, 255], 10500, 107, -127, -32767));
+        expand(
+            &src,
+            &mut dst,
+            8,
+            &[(0, 49), (2, 56), (4, 61), (5, 63), (6, 58)],
+            false,
+            false,
+        );
+        assert_eq!(&dst[40..], &src[..8]);
+    }
+
+    #[test]
+    fn guarded_stride_skips_empty_and_unrepresentable_rectangles() {
+        let mut dst = [7; 16];
+        for stride in [0, usize::MAX / 3] {
+            expand(&[0; 8], &mut dst, stride, &[], false, true);
+            assert_eq!(dst, [7; 16]);
+        }
+    }
     use super::*;
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top

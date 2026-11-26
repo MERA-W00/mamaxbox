@@ -55,6 +55,8 @@ pub(crate) fn all() -> Vec<HleModule> {
         xg::module(),
     ];
     #[cfg(windows)]
+    if victory_gpu::title_hold::enabled() { all.push(kernel::sleep_module()); }
+    #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]
     all.push(media::module());
@@ -68,6 +70,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(net::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(windows)]
+    if let Some(module) = xmem::virtual_memory_module() { all.push(module); }
     #[cfg(windows)]
     all.push(xsystem::module());
     all

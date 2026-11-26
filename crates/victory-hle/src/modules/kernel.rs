@@ -350,6 +350,61 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// Approach after XCL 9cdae10: a long watchdog sleep measures the time a
+/// title can run. Subtract the overlap with host work and sleep for the
+/// balance. Short polling sleeps and the infinite sentinel go to Windows.
+#[cfg(windows)]
+pub extern "system" fn Sleep(ms: u32) {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::Sleep as host_sleep;
+    if !(100..u32::MAX).contains(&ms) {
+        unsafe { host_sleep(ms) };
+        return;
+    }
+    let start = Instant::now();
+    let held = victory_gpu::title_hold::elapsed();
+    let target = Duration::from_millis(ms.into());
+    let mut left = target;
+    while !left.is_zero() {
+        unsafe { host_sleep(left.as_nanos().div_ceil(1_000_000) as u32) };
+        let overlap = victory_gpu::title_hold::elapsed() - held;
+        left = sleep_remaining(target, start.elapsed(), overlap);
+        if left.is_zero() && overlap.as_millis() > 0 {
+            tracing::debug!(
+                requested_ms = ms,
+                held_ms = overlap.as_millis() as u64,
+                "title sleep extended"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sleep_remaining(
+    target: std::time::Duration,
+    wall: std::time::Duration,
+    held: std::time::Duration,
+) -> std::time::Duration {
+    target.saturating_sub(wall.saturating_sub(held))
+}
+
+#[cfg(windows)]
+pub(crate) fn sleep_module() -> HleModule {
+    HleModule {
+        name: "title sleep",
+        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-synch-*"],
+        exports: vec![hle_export!(Sleep)],
+    }
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn long_sleep_uses_only_time_outside_a_host_hold() {
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(sleep_remaining(ms(1000), ms(1000), ms(450)), ms(450));
+    assert_eq!(sleep_remaining(ms(1000), ms(1500), ms(450)), ms(0));
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",

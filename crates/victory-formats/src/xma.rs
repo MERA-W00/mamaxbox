@@ -490,6 +490,10 @@ impl Decoder {
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
     /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
+        static BOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bound = *BOUND
+            .get_or_init(|| std::env::var_os("VICTORY_XMA_FRAME_BOUNDS").is_some_and(|v| v == "1"));
+        let bits = frame_bits(data.len(), bits, bound);
         let mut b = Bits {
             data,
             pos: 0,
@@ -1019,8 +1023,25 @@ fn to_i16(v: f32) -> i16 {
     (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }
 
+/// The decoder can read padding as zero. When the declared length exceeds the payload,
+/// stopping at its last real bit lets the tile reader report the incomplete frame.
+fn frame_bits(bytes: usize, declared: usize, bound: bool) -> usize {
+    if bound {
+        declared.min(bytes.saturating_mul(8))
+    } else {
+        declared
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_end_preserves_short_bit_lengths_and_bounds_padding() {
+        assert_eq!(super::frame_bits(4, 23, true), 23);
+        assert_eq!(super::frame_bits(4, 33, true), 32);
+        assert_eq!(super::frame_bits(4, 33, false), 33);
+        assert_eq!(super::frame_bits(0, 1, true), 0);
+    }
     use super::*;
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.

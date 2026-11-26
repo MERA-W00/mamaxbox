@@ -63,6 +63,27 @@ const TILE: u64 = 64 << 10;
 /// 4096x4096 one of one byte a texel: 256 tiles.
 const HEAP_TILES: u32 = 1024;
 
+/// Approach after XCL 3ea5edc: admit mips as tile groups when their upload
+/// has texels. A small amount of newly freed memory can fit the packed tail
+/// and coarse levels while the largest level still waits for room.
+fn levels_with_room(standard: &[u32], packed: u32, missing: u32, bytes: u64) -> u32 {
+    let mut tiles = bytes / TILE;
+    let mut allowed = 0;
+    let tail = missing & (u32::MAX << standard.len());
+    if tail != 0 && u64::from(packed) <= tiles {
+        allowed |= tail;
+        tiles -= u64::from(packed);
+    }
+    for (level, &count) in standard.iter().enumerate().rev() {
+        let bit = 1 << level;
+        if missing & bit != 0 && u64::from(count) <= tiles {
+            allowed |= bit;
+            tiles -= u64::from(count);
+        }
+    }
+    allowed
+}
+
 /// Since the start, or now: such textures alive; the bytes all their
 /// levels would take; the bytes of the tiles given to them; the bytes of
 /// the pool's heaps; such textures made in all; levels given; calls of
@@ -138,6 +159,17 @@ struct Heap {
 unsafe impl Send for Heap {}
 
 impl Heap {
+    /// Opening title pages gives a custom L0 heap. The probe found that
+    /// sending such a heap to UpdateTileMappings removes the device.
+    /// Check once, before the pool can hand out any tiles from a heap.
+    fn admit(heap: ID3D12Heap) -> Option<Self> {
+        // SAFETY: the caller holds a live heap.
+        if unsafe { heap.GetDesc().Properties.Type } != D3D12_HEAP_TYPE_DEFAULT {
+            return None;
+        }
+        Some(Self { heap, free: vec![(0, HEAP_TILES)] })
+    }
+
     fn free_tiles(&self) -> u32 {
         self.free.iter().map(|run| run.1).sum()
     }
@@ -146,6 +178,11 @@ impl Heap {
 /// The pool's heaps by place; a place is empty after its heap went back to
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn rejects_test_heap(heap: ID3D12Heap) -> bool {
+    Heap::admit(heap).is_none()
+}
 
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
@@ -175,10 +212,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
-            let fresh = Heap {
-                heap: made?,
-                free: vec![(0, HEAP_TILES)],
-            };
+            let fresh = Heap::admit(made?)?;
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
                 Some(index) => {
@@ -343,26 +377,47 @@ impl Tiled {
     /// At the submission of a list that uploads every level of `texture`
     /// from its staging buffer, of which `held` are the title's now (the
     /// others are zeros there): tiles for the held ones that have none.
-    /// `room`: whether the card has room for more host copies
-    /// (`resource.rs` `room`). Without room no held level gets tiles: the
+    /// Without room under the texture budget no held level gets tiles. The
     /// list still brings the levels that have theirs up to date (which
     /// takes none of the card's memory), and its copies into the others go
     /// nowhere. (An upload of a host copy that exists passes the full
     /// card's gate in `draw.rs` on the ground that it takes no memory;
     /// with tiles given here regardless, the line would not bound these
     /// textures.)
-    /// Returns whether the first level a view may show changed, and
-    /// whether a level named is still without tiles (no room, or no heap
-    /// could be had): the caller has the upload recorded again later, or
-    /// the level would stay empty until the title writes the texture.
-    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32, room: bool) -> (bool, bool) {
+    /// Returns whether the first visible level changed and what the next
+    /// retry needs. Zero means all held levels have backing. The ordinary
+    /// gate asks for any room (one byte). With `VICTORY_TEXTURE_LEVEL_BUDGET=1`
+    /// it asks for enough bytes for the smallest missing group.
+    pub(crate) fn uploaded(&self, texture: &ID3D12Resource, held: u32) -> (bool, u64) {
         match host() {
-            Some(host) => self.uploaded_on(host.queue(), &host.device, texture, held, room),
-            None => (false, false),
+            Some(host) => {
+                static BUDGET: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                    std::env::var_os("VICTORY_TEXTURE_LEVEL_BUDGET").is_some_and(|v| v == "1")
+                });
+                let bytes = if *BUDGET {
+                    crate::resource::texture_headroom(true)
+                } else if crate::resource::room() {
+                    u64::MAX
+                } else {
+                    0
+                };
+                let (changed, needed) =
+                    self.uploaded_with_room(host.queue(), &host.device, texture, held, bytes);
+                (
+                    changed,
+                    if *BUDGET {
+                        needed
+                    } else {
+                        u64::from(needed != 0)
+                    },
+                )
+            }
+            None => (false, 0),
         }
     }
 
     /// [`Tiled::uploaded`] on a queue and a device.
+    #[cfg(test)]
     pub(crate) fn uploaded_on(
         &self,
         queue: &ID3D12CommandQueue,
@@ -371,6 +426,24 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        let (changed, needed) = self.uploaded_with_room(
+            queue,
+            device,
+            texture,
+            held,
+            if room { u64::MAX } else { 0 },
+        );
+        (changed, needed != 0)
+    }
+
+    fn uploaded_with_room(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        bytes: u64,
+    ) -> (bool, u64) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
@@ -378,9 +451,35 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
-        let missing = self.without_locked(&given, named) != 0;
-        (changed, missing)
+        let may = match bytes {
+            0 => card,
+            u64::MAX => named,
+            _ => {
+                card | levels_with_room(
+                    &self.standard,
+                    self.packed,
+                    self.without_locked(&given, held),
+                    bytes,
+                )
+            }
+        };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
+        let missing = self.without_locked(&given, named);
+        let needed = if missing == 0 {
+            0
+        } else {
+            let tail = (missing >> self.standard.len() != 0).then_some(self.packed);
+            let smallest = self
+                .standard
+                .iter()
+                .enumerate()
+                .filter_map(|(level, &tiles)| (missing & (1 << level) != 0).then_some(tiles))
+                .chain(tail)
+                .min()
+                .unwrap_or(0);
+            u64::from(smallest) * TILE
+        };
+        (changed, needed)
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -733,6 +832,16 @@ pub(crate) fn status() {
 /// and no wait is longer than 1.5 s.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_partial_budget_backs_whole_groups_starting_with_the_tail() {
+        use super::{TILE, levels_with_room};
+        let levels = [8, 4, 2];
+        assert_eq!(levels_with_room(&levels, 1, 0b11111, TILE - 1), 0);
+        assert_eq!(levels_with_room(&levels, 1, 0b11111, TILE), 0b11000);
+        assert_eq!(levels_with_room(&levels, 1, 0b11111, 3 * TILE), 0b11100);
+        assert_eq!(levels_with_room(&levels, 1, 0b00011, 4 * TILE), 0b00010);
+        assert_eq!(levels_with_room(&levels, 1, 0b11001, 9 * TILE), 0b11001);
+    }
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::*;
@@ -1386,6 +1495,23 @@ void look() {
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
+        // A reclaimed group can fit the coarsest mip while level zero
+        // still waits. Check both the memory charged and the texels read.
+        let (other, limited) = rig.reserved(&desc);
+        let last = limited.levels - 1;
+        let tail = limited.standard.get(last as usize).copied().unwrap_or(limited.packed);
+        let small = u64::from(tail) * TILE;
+        let held = 1 | (1 << last);
+        let (changed, needed) = limited.uploaded_with_room(&rig.queue, &rig.device, &other, held, small);
+        assert!(changed && limited.has_tiles(last) && !limited.has_tiles(0));
+        assert_eq!(needed, u64::from(limited.standard[0]) * TILE);
+        assert_eq!(limited.given_bytes(), small);
+        let bytes = rig.round_trip(&other, &layout, Some(&upload));
+        assert!(all(&bytes[0], 0) && all(&bytes[last as usize], last as u8 + 1));
+        let (changed, still_needed) = limited.uploaded_with_room(&rig.queue, &rig.device, &other, held, needed);
+        assert!(changed && still_needed == 0);
+        assert_eq!(limited.given_bytes(), small + needed);
+        assert!(all(&rig.round_trip(&other, &layout, Some(&upload))[0], 1));
         // Asked again with room: the same levels get theirs.
         let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
         rig.check("the upload again, with room");
