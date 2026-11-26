@@ -77,7 +77,7 @@ impl Pending {
         }
     }
 
-    fn make(self: &Arc<Self>) {
+    pub(in crate::pipeline) fn make(self: &Arc<Self>) {
         if self.made.get().is_none() {
             let should_skip = is_bad_key(&self.key) || super::is_skipped_shaders(&self.shaders);
             let made = if should_skip {
@@ -115,7 +115,9 @@ static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
 /// The keys of the pipelines the driver's compiler crashed on (`warm-bad.txt`
 /// beside the pipeline library, one key per line; `#` starts a comment), loaded
-/// on first use. `VICTORY_WARM_BAD=0` leaves the file unread.
+/// on first use. Also harvests `in-flight-compile.txt` if a previous run died
+/// abruptly inside a native Linux/Unix driver call (`libnvidia-gpucomp.so` SIGILL/SIGABRT)
+/// that bypassed Windows PE Vectored Exception Handling.
 static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
@@ -123,6 +125,31 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
     let keys = keys.get_or_insert_with(|| {
         if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
             return Default::default();
+        }
+        if let Some(ref dir) = super::library::folder() {
+            let inflight = dir.join("in-flight-compile.txt");
+            if let Ok(text) = std::fs::read_to_string(&inflight) {
+                let trimmed = text.trim();
+                if let Some(crashed_key) = trimmed.split_whitespace().next()
+                    && crashed_key.len() == 32
+                    && crashed_key.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    tracing::warn!(
+                        entry = %trimmed,
+                        "quarantining pipeline from previous native driver compiler crash into warm-bad.txt"
+                    );
+                    let _ = std::fs::create_dir_all(dir);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("warm-bad.txt"))
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{trimmed}");
+                    }
+                }
+                let _ = std::fs::write(&inflight, b"");
+            }
         }
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
@@ -137,8 +164,90 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
     f(keys)
 }
 
-fn is_bad_key(key: &str) -> bool {
+pub(in crate::pipeline) fn is_bad_key(key: &str) -> bool {
     bad_keys(|keys| keys.contains(key))
+}
+
+thread_local! {
+    static JOURNAL_ENTRY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+pub(in crate::pipeline) fn set_journal_context(p: &Pending) {
+    let _ = JOURNAL_ENTRY.try_with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.clear();
+        use std::fmt::Write;
+        let _ = write!(s, "{} native-driver-crash: {:?}", p.key, p.shaders);
+    });
+}
+
+/// Crash-surviving journal guard held strictly inside `driver_compile_lock()`.
+/// Writes the active pipeline key to OS page cache before calling the host
+/// driver and truncates it on return so Unix-side SIGILL/SIGSEGV crashes in
+/// `libnvidia-gpucomp.so` self-quarantine on the next start.
+pub(in crate::pipeline) struct DriverJournal(bool);
+
+static JOURNAL_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn journal_file() -> Option<&'static Mutex<std::fs::File>> {
+    JOURNAL_FILE
+        .get_or_init(|| {
+            if !guard_on() {
+                return None;
+            }
+            // Ensure previous crash entry is harvested before opening/truncating!
+            let _ = bad_keys(|_| ());
+            let dir = super::library::folder()?;
+            let _ = std::fs::create_dir_all(&dir);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dir.join("in-flight-compile.txt"))
+                .ok()?;
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+}
+
+impl DriverJournal {
+    pub(in crate::pipeline) fn enter() -> Self {
+        let Some(lock) = journal_file() else {
+            return Self(false);
+        };
+        let wrote = JOURNAL_ENTRY
+            .try_with(|cell| {
+                let text = cell.borrow();
+                if text.is_empty() {
+                    return false;
+                }
+                if let Ok(mut f) = lock.lock() {
+                    use std::io::{Seek, SeekFrom, Write};
+                    let _ = f.seek(SeekFrom::Start(0));
+                    let _ = f.write_all(text.as_bytes());
+                    let _ = f.set_len(text.len() as u64);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        Self(wrote)
+    }
+}
+
+impl Drop for DriverJournal {
+    fn drop(&mut self) {
+        if self.0
+            && let Some(lock) = journal_file()
+            && let Ok(mut f) = lock.lock()
+        {
+            use std::io::{Seek, SeekFrom};
+            let _ = f.seek(SeekFrom::Start(0));
+            let _ = f.set_len(0);
+        }
+    }
 }
 
 /// Whether driver shader-compiler crashes on pipeline workers are caught

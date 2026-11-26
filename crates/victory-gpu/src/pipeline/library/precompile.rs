@@ -56,16 +56,21 @@ fn completed() -> &'static Mutex<HashSet<String>> {
 /// makes that second object lazily. The offline pass can make both before
 /// marking the title recipe complete.
 pub(in crate::pipeline) fn build(p: &Pending, offline: bool) -> Option<HostPipeline> {
+    if crate::pipeline::make::is_bad_key(&p.key) || crate::pipeline::is_skipped_shaders(&p.shaders) {
+        return None;
+    }
+    crate::pipeline::make::set_journal_context(p);
     IN_LIBRARY.set(false);
     let host = HostPipeline::new(&p.shaders, p.graphics.as_deref())?;
-    if IN_LIBRARY.get() && tracking() {
+    let no_lib = library().is_none();
+    if (IN_LIBRARY.get() || no_lib) && tracking() {
         if let Some(launch) = &host.launch {
             IN_LIBRARY.set(false);
             if offline {
                 launch.plain()?;
             }
         }
-        if IN_LIBRARY.get() {
+        if IN_LIBRARY.get() || no_lib {
             completed().lock().unwrap().insert(p.key.clone());
         }
     }
@@ -117,14 +122,15 @@ fn header(dir: &Path, identity: &str) -> io::Result<String> {
     } else {
         dir.join(LIBRARY_FILE)
     };
-    let lib = file.metadata()?;
-    let shaders = dir.with_file_name("shaders").metadata()?;
-    Ok(format!(
-        "{identity} {} {} {}",
-        lib.file_size(),
-        lib.last_write_time(),
-        shaders.creation_time()
-    ))
+    let (lib_size, lib_mtime) = match file.metadata() {
+        Ok(lib) => (lib.file_size(), lib.last_write_time()),
+        Err(_) => (0, 0),
+    };
+    let shaders_ctime = dir
+        .with_file_name("shaders")
+        .metadata()
+        .map_or(0, |m| m.creation_time());
+    Ok(format!("{identity} {lib_size} {lib_mtime} {shaders_ctime}"))
 }
 
 fn read_keys(dir: &Path, header: &str) -> HashSet<String> {

@@ -576,6 +576,7 @@ pub(crate) fn pipeline(
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         let _driver_lock = driver_compile_lock();
+        let _journal = super::make::DriverJournal::enter();
         return create();
     };
     let began = std::time::Instant::now();
@@ -603,6 +604,7 @@ pub(crate) fn pipeline(
     // Compiled under driver_compile_lock to prevent driver compiler concurrency crashes.
     let pso = {
         let _driver_lock = driver_compile_lock();
+        let _journal = super::make::DriverJournal::enter();
         let _call = call("make", name);
         create()?
     };
