@@ -111,9 +111,6 @@ enum Command {
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
         title_args: Vec<String>,
-        /// Skip intro videos, logos and boot screen cutscenes.
-        #[arg(long)]
-        skip_boot: bool,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -186,8 +183,7 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args,
-            skip_boot,
-        } => run::run(&exe, unimplemented, strict, execute, console, skip_boot, title_args),
+        } => run::run(&exe, unimplemented, strict, execute, console, title_args),
         Command::Config => show_config(),
         Command::NetworkStatus => show_network_status(),
     }

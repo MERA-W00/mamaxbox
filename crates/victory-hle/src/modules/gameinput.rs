@@ -1187,9 +1187,6 @@ mod host {
                             }
                             if buttons != 0 {
                                 victory_core::input_status::set_last_button(buttons);
-                                if buttons & MENU != 0 {
-                                    crate::modules::files::set_skip_boot(true);
-                                }
                             }
                         }
                     }
@@ -1205,11 +1202,9 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
                 self.empty_until[slot] = None;
-                let mut pad = convert(&state.Gamepad);
-                if pad.buttons & MENU != 0 {
+                let pad = convert(&state.Gamepad);
+                if pad.buttons != 0 {
                     victory_core::input_status::set_last_button(pad.buttons);
-                    crate::modules::files::set_skip_boot(true);
-                    pad.buttons |= A | MENU;
                 }
                 return Some(pad);
             }
@@ -1217,11 +1212,7 @@ mod host {
             // Direct PS5 / Linux joystick fallback for Slot 0 when XInput does not see device
             if slot == 0 && LINUX_PAD_CONNECTED.load(Ordering::Relaxed) {
                 if let Ok(lock) = LINUX_PAD_STATE.lock() {
-                    if let Some(mut pad) = *lock {
-                        if pad.buttons & MENU != 0 {
-                            crate::modules::files::set_skip_boot(true);
-                            pad.buttons |= A | MENU;
-                        }
+                    if let Some(pad) = *lock {
                         return Some(pad);
                     }
                 }

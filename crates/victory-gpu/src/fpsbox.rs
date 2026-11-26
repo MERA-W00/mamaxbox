@@ -27,9 +27,6 @@ static DRAWS: AtomicU32 = AtomicU32::new(21);
 static GPU_OVERLOAD: AtomicBool = AtomicBool::new(false);
 static OVERLOAD_MESSAGE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Global skip-boot preference (defaults to true if VICTORY_SKIP_BOOT != "0")
-static SKIP_BOOT: AtomicBool = AtomicBool::new(true);
-
 pub fn is_gpu_overloaded() -> bool {
     GPU_OVERLOAD.load(Ordering::Relaxed)
 }
@@ -49,14 +46,6 @@ pub fn clear_gpu_overload() {
     GPU_OVERLOAD.store(false, Ordering::Relaxed);
     let mut msg = OVERLOAD_MESSAGE.lock().unwrap_or_else(|e| e.into_inner());
     *msg = None;
-}
-
-pub fn is_skip_boot() -> bool {
-    SKIP_BOOT.load(Ordering::Relaxed)
-}
-
-pub fn set_skip_boot(val: bool) {
-    SKIP_BOOT.store(val, Ordering::Relaxed);
 }
 
 /// Whether CPU & GPU performance graphs are displayed in top-right (toggled via F4).
@@ -542,13 +531,6 @@ fn check_keys() {
     static LAST_BTN: AtomicU32 = AtomicU32::new(0);
     let prev_btn = LAST_BTN.swap(btn, Ordering::Relaxed);
     if btn != 0 && btn != prev_btn {
-        // PS5 Controller Menu (Options) button: bit 0x1 triggers skip boot screen & cutscenes
-        if btn & 0x1 != 0 {
-            set_skip_boot(true);
-            trigger_toast("[PS5 MENU] SKIPPING BOOT / INTRO");
-            tracing::info!("PS5 Menu button pressed: skipping boot screen / intro cutscenes");
-        }
-
         if MENU_OPEN.load(Ordering::Relaxed) {
             if btn & 0x40 != 0 {
                 // D-Pad Up
@@ -767,7 +749,7 @@ fn get_overlay_lines(
         lines.push("  ACTION: [SQR / X / X]          MENU: [TRI / Y / Y]".to_string());
         lines.push("  TABS  : [L1/R1 / Q/E]          AIM/FIRE: [L2/R2 / Z/C]".to_string());
         lines.push("  STICKS: [WASD / IJKL]          NAV: [D-PAD / ARROW KEYS]".to_string());
-        lines.push("  SKIP BOOT: [PS5 MENU (OPTIONS)]  GRAPHS: [F4 TOP-RIGHT]".to_string());
+        lines.push("  GRAPHS: [F4 TOP-RIGHT]".to_string());
     }
 
     lines.push("===================================================================".to_string());
